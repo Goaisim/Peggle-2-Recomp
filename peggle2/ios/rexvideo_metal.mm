@@ -837,6 +837,7 @@ class MetalCommandProcessor final : public CommandProcessor {
           const_ring_[i] ? static_cast<uint8_t*>([const_ring_[i] contents]) : nullptr;
       if (const_ring_[i]) g_cur_buf_allocs.fetch_add(1, std::memory_order_relaxed);
       frame_overflow_bufs_[i].clear();
+      frame_overflow_textures_[i].clear();
     }
     ring_slot_ = 0;
     swap_index_ = 0;
@@ -873,6 +874,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       const_ring_[i] = nil;
       const_ring_ptr_[i] = nullptr;
       frame_overflow_bufs_[i].clear();
+      frame_overflow_textures_[i].clear();
     }
     ring_sem_ = nil;
     gpu_mem_ = nil;
@@ -1407,6 +1409,7 @@ class MetalCommandProcessor final : public CommandProcessor {
           dispatch_semaphore_wait(ring_sem_, DISPATCH_TIME_FOREVER);
         }
         frame_overflow_bufs_[ring_slot_].clear();
+        frame_overflow_textures_[ring_slot_].clear();
         ring_offset_ = 0;
       }
       ResetConstCache();
@@ -1440,11 +1443,12 @@ class MetalCommandProcessor final : public CommandProcessor {
 
  private:
   static constexpr int kConstRingSlots = 3;
+  static constexpr int kTexRingSlots = 4;
   static constexpr uint32_t kConstRingBytes = 4u * 1024u * 1024u;
 
   struct TexEntry {
-    id<MTLTexture> textures[kConstRingSlots]{};
-    uint64_t slot_used_gen[kConstRingSlots]{};
+    id<MTLTexture> textures[kTexRingSlots]{};
+    uint64_t slot_used_gen[kTexRingSlots]{};
     uint64_t data_hash = 0;
     uint64_t sample_hash = 0;
     uint64_t checked_gen = 0;
@@ -1453,6 +1457,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t swizzle = 0;
+    uint32_t mutation_count = 0;
     MTLPixelFormat pf = MTLPixelFormatInvalid;
     int active_slot = 0;
     bool is_dynamic = false;
@@ -1731,12 +1736,9 @@ class MetalCommandProcessor final : public CommandProcessor {
 
     const uint64_t key = XXH3_64bits(&fetch, sizeof(fetch));
     TexEntry& entry = textures_[key];
-    const bool is_video_or_linear =
-        !fetch.tiled || (fetch.format == xenos::TextureFormat::k_8);
     id<MTLTexture> active_tex = entry.textures[entry.active_slot];
-    // Same-frame fast hit for static tiled textures (dynamic/video textures always verify hash).
-    if (active_tex && entry.checked_gen == generation_ && !entry.is_dynamic &&
-        !is_video_or_linear) {
+    // Same-frame fast hit for all textures (IssueCopy range eviction handles mid-frame updates).
+    if (active_tex && entry.checked_gen == generation_) {
       entry.slot_used_gen[entry.active_slot] = generation_;
       return active_tex;
     }
@@ -1746,6 +1748,8 @@ class MetalCommandProcessor final : public CommandProcessor {
                                                    &mip_min, &mip_max);
     if (!base_page) return nil;
     const uint32_t width = w1 + 1, height = h1 + 1;
+    const bool is_video_plane =
+        (fetch.format == xenos::TextureFormat::k_8) && (width >= 320u && height >= 180u);
 
     const auto* info = FormatInfo::Get(uint32_t(fetch.format));
     if (!info) return nil;
@@ -1767,9 +1771,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     const uint32_t extent = layout.base.level_data_extent_bytes;
     if (extent == 0 || uint64_t(phys_off) + extent > 0x1FFF0000ULL) return nil;
     const uint8_t* base = memory_->TranslatePhysical<const uint8_t*>(base_page << 12);
-    const bool use_ring = entry.is_dynamic || is_video_or_linear;
-    const uint64_t sample_hash = use_ring ? 0ull : SampleTexFingerprint(base, extent);
-    if (!use_ring && active_tex && entry.phys_start == phys_off &&
+    const bool full_hash_every_frame = entry.is_dynamic || is_video_plane;
+    const uint64_t sample_hash = full_hash_every_frame ? 0ull : SampleTexFingerprint(base, extent);
+    if (!full_hash_every_frame && active_tex && entry.phys_start == phys_off &&
         entry.phys_end == phys_off + extent && entry.width == width && entry.height == height &&
         extent > 16384u && sample_hash == entry.sample_hash && ((key + generation_) & 63u) != 0u) {
       entry.checked_gen = generation_;
@@ -1786,8 +1790,12 @@ class MetalCommandProcessor final : public CommandProcessor {
       entry.slot_used_gen[entry.active_slot] = generation_;
       return active_tex;
     }
-    if (active_tex != nil || is_video_or_linear) {
-      entry.is_dynamic = true;
+    const bool had_existing = (active_tex != nil);
+    if (had_existing) {
+      ++entry.mutation_count;
+      if (entry.mutation_count >= 2u) {
+        entry.is_dynamic = true;
+      }
     }
     entry.data_hash = new_hash;
 
@@ -1925,11 +1933,11 @@ class MetalCommandProcessor final : public CommandProcessor {
     }
 
     int target_slot = 0;
-    if (entry.is_dynamic || is_video_or_linear) {
-      const int preferred = int(swap_index_ % kConstRingSlots);
+    if (entry.is_dynamic || is_video_plane || had_existing) {
+      const int preferred = int(swap_index_ % kTexRingSlots);
       target_slot = -1;
-      for (int k = 0; k < kConstRingSlots; ++k) {
-        const int cand = (preferred + k) % kConstRingSlots;
+      for (int k = 0; k < kTexRingSlots; ++k) {
+        const int cand = (preferred + k) % kTexRingSlots;
         if (entry.slot_used_gen[cand] == 0 ||
             (generation_ - entry.slot_used_gen[cand]) >= uint64_t(kConstRingSlots)) {
           target_slot = cand;
@@ -1937,11 +1945,12 @@ class MetalCommandProcessor final : public CommandProcessor {
         }
       }
       if (target_slot < 0) {
-        Submit(true);
-        for (int k = 0; k < kConstRingSlots; ++k) {
-          entry.slot_used_gen[k] = 0;
-        }
+        // All 4 ring slots were used within the last 2 frames; retire old texture without stalling.
         target_slot = preferred;
+        if (entry.textures[target_slot]) {
+          frame_overflow_textures_[ring_slot_].push_back(entry.textures[target_slot]);
+          entry.textures[target_slot] = nil;
+        }
       }
     }
 
@@ -1961,8 +1970,11 @@ class MetalCommandProcessor final : public CommandProcessor {
       if (pf == MTLPixelFormatInvalid) return nil;
       if (entry.pf != pf || entry.width != width || entry.height != height ||
           entry.swizzle != fetch.swizzle) {
-        for (int k = 0; k < kConstRingSlots; ++k) {
-          entry.textures[k] = nil;
+        for (int k = 0; k < kTexRingSlots; ++k) {
+          if (entry.textures[k]) {
+            frame_overflow_textures_[ring_slot_].push_back(entry.textures[k]);
+            entry.textures[k] = nil;
+          }
           entry.slot_used_gen[k] = 0;
         }
       }
@@ -2344,6 +2356,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   id<MTLBuffer> const_ring_[kConstRingSlots]{};
   uint8_t* const_ring_ptr_[kConstRingSlots]{};
   std::vector<id<MTLBuffer>> frame_overflow_bufs_[kConstRingSlots];
+  std::vector<id<MTLTexture>> frame_overflow_textures_[kConstRingSlots];
   dispatch_semaphore_t ring_sem_ = nil;
   int ring_slot_ = 0;
   uint64_t swap_index_ = 0;
