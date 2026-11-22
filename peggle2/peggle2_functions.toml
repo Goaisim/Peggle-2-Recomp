@@ -1,0 +1,4 @@
+# Manual function boundaries for codegen
+[functions]
+0x823320D8 = { size = 8 }
+

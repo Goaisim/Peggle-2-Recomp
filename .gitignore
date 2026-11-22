@@ -1,0 +1,44 @@
+# Build artifacts & IDEs
+out/
+build/
+build-ios/
+build-smoke/
+.vs/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.ipa
+*.app/
+*.air
+ipa_stage/
+
+# Local SDK checkout & temp clones (CI clones & patches rexglue-sdk)
+sdk/
+temp_peggle2_mac/
+
+# Retail game files & asset formats (never commit retail game data)
+assets/
+bundled_assets/
+game/
+peggle2/game/
+peggle2_assets.zip
+*.xex
+*.iso
+*.rsb
+*.pak
+*.bik
+*.xma
+*.stfs
+*.xbla
+
+# Local captures, logs, media & root scratch scripts
+captures/
+logs/
+*.log
+*.mp4
+*.png
+/*.py
+input.txt

@@ -1,0 +1,199 @@
+name: iOS Build (.ipa)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios-ipa:
+    name: Build Self-Contained Peggle2-iOS.ipa (ARM64)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: brew install cmake ninja ffmpeg
+
+      - name: Prepare ReXGlue SDK with iOS/Metal patch
+        id: sdk
+        run: |
+          set -euo pipefail
+          SDK_DIR="${RUNNER_TEMP}/rexglue-sdk"
+          PATCH_FILE="${GITHUB_WORKSPACE}/peggle2/ios/rexglue-sdk.patch"
+          BASE_COMMIT="f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
+
+          rm -rf "${SDK_DIR}"
+          git clone https://github.com/rexglue/rexglue-sdk.git "${SDK_DIR}"
+          git -C "${SDK_DIR}" checkout "${BASE_COMMIT}"
+          git -C "${SDK_DIR}" submodule update --init --jobs 8 \
+            thirdparty/cli11 \
+            thirdparty/libmspack \
+            thirdparty/FFmpeg \
+            thirdparty/tomlplusplus \
+            thirdparty/simde \
+            thirdparty/xxHash \
+            thirdparty/spdlog \
+            thirdparty/fmt \
+            thirdparty/utfcpp \
+            thirdparty/imgui \
+            thirdparty/o1heap
+          git -C "${SDK_DIR}" apply --check "${PATCH_FILE}"
+          git -C "${SDK_DIR}" apply "${PATCH_FILE}"
+
+          echo "dir=${SDK_DIR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify generated recompiled guest sources exist
+        run: |
+          if [ ! -f "peggle2/generated/default/sources.cmake" ]; then
+            echo "::error::peggle2/generated/default/sources.cmake not found."
+            exit 1
+          fi
+
+      - name: Configure CMake (iOS ARM64 Xcode)
+        run: |
+          cmake -S peggle2 -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DREXSDK_DIR="${{ steps.sdk.outputs.dir }}"
+
+      - name: Build unsigned iOS app bundle
+        run: |
+          xcodebuild \
+            -project build-ios/peggle2.xcodeproj \
+            -scheme peggle2 \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Stage asset-free Payload/peggle2.app with ad-hoc entitlements, and package Peggle2-iOS.ipa
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find build-ios -name 'peggle2.app' -type d | head -n 1)"
+          if [ -z "${APP_PATH}" ] || [ ! -d "${APP_PATH}" ]; then
+            echo "::error::peggle2.app was not produced by xcodebuild"
+            exit 1
+          fi
+
+          rm -rf ipa_stage
+          mkdir -p ipa_stage/Payload
+          cp -R "${APP_PATH}" ipa_stage/Payload/peggle2.app
+          cp peggle2/ios/peggle2.toml ipa_stage/Payload/peggle2.app/peggle2.toml
+
+          codesign --force --sign - \
+            --entitlements peggle2/ios/Entitlements.plist \
+            --timestamp=none \
+            ipa_stage/Payload/peggle2.app
+
+          (cd ipa_stage && zip -qry "${GITHUB_WORKSPACE}/Peggle2-iOS.ipa" Payload)
+          ls -lh "${GITHUB_WORKSPACE}/Peggle2-iOS.ipa"
+
+      - name: ARM64 16KB Arena, VFS, MMIO & iOS Metal Shader Smoke Verification
+        run: |
+          set -euo pipefail
+          SDK_DIR="${{ steps.sdk.outputs.dir }}"
+          mkdir -p build-smoke/metal
+          xcrun clang -c -arch arm64 -O2 "${SDK_DIR}/thirdparty/xxHash/xxhash.c" -o build-smoke/xxhash.o
+          xcrun clang++ -c -std=c++23 -arch arm64 -O2 -fexperimental-library \
+            -DREX_PLATFORM_MAC=1 -DREX_PLATFORM_IOS=1 -DREX_ARCH_ARM64=1 \
+            -DREXGLUE_BUILD_CONFIG='"Release"' -DSPDLOG_FMT_EXTERNAL=1 \
+            -I"${SDK_DIR}" \
+            -I"${SDK_DIR}/include" \
+            -I"build-ios/rexglue-sdk/include" \
+            -I"${SDK_DIR}/thirdparty/fmt/include" \
+            -I"${SDK_DIR}/thirdparty/spdlog/include" \
+            -I"${SDK_DIR}/thirdparty/disruptorplus/include" \
+            "${SDK_DIR}/src/core/timer_queue.cpp" -o build-smoke/timer_queue.o
+          xcrun clang++ -std=c++23 -arch arm64 -O2 -fobjc-arc \
+            -DREX_PLATFORM_MAC=1 -DREX_PLATFORM_IOS=1 -DREX_ARCH_ARM64=1 \
+            -DREXGLUE_BUILD_CONFIG='"Release"' -DSPDLOG_FMT_EXTERNAL=1 \
+            -I"${SDK_DIR}" \
+            -I"${SDK_DIR}/include" \
+            -I"build-ios/rexglue-sdk/include" \
+            -I"${SDK_DIR}/thirdparty/fmt/include" \
+            -I"${SDK_DIR}/thirdparty/spdlog/include" \
+            -I"${SDK_DIR}/thirdparty/tomlplusplus/include" \
+            -I"${SDK_DIR}/thirdparty/simde" \
+            -I"${SDK_DIR}/thirdparty/xxHash" \
+            -I"${SDK_DIR}/thirdparty/cli11/include" \
+            -I"${SDK_DIR}/thirdparty/utfcpp/source" \
+            -I"${SDK_DIR}/thirdparty/disruptorplus/include" \
+            -I"${SDK_DIR}/thirdparty/renderdoc" \
+            -I"peggle2/ios" \
+            peggle2/ios/ios_smoke_test.mm \
+            peggle2/ios/msl_translator.cpp \
+            build-smoke/xxhash.o \
+            build-smoke/timer_queue.o \
+            "${SDK_DIR}/thirdparty/fmt/src/format.cc" \
+            "${SDK_DIR}/thirdparty/fmt/src/os.cc" \
+            "${SDK_DIR}/src/core/arena.cpp" \
+            "${SDK_DIR}/src/core/atomic_posix.cpp" \
+            "${SDK_DIR}/src/core/bit_map.cpp" \
+            "${SDK_DIR}/src/core/bit_stream.cpp" \
+            "${SDK_DIR}/src/core/byte_stream.cpp" \
+            "${SDK_DIR}/src/core/clock.cpp" \
+            "${SDK_DIR}/src/core/clock_posix.cpp" \
+            "${SDK_DIR}/src/core/cvar.cpp" \
+            "${SDK_DIR}/src/core/dbg_posix.cpp" \
+            "${SDK_DIR}/src/core/dynlib_posix.cpp" \
+            "${SDK_DIR}/src/core/exception_handler.cpp" \
+            "${SDK_DIR}/src/core/exception_handler_posix.cpp" \
+            "${SDK_DIR}/src/core/fiber_posix.cpp" \
+            "${SDK_DIR}/src/core/filesystem.cpp" \
+            "${SDK_DIR}/src/core/filesystem_posix.cpp" \
+            "${SDK_DIR}/src/core/filesystem_wildcard.cpp" \
+            "${SDK_DIR}/src/core/hash.cpp" \
+            "${SDK_DIR}/src/core/logging.cpp" \
+            "${SDK_DIR}/src/core/mapped_memory_posix.cpp" \
+            "${SDK_DIR}/src/core/math_gcc.cpp" \
+            "${SDK_DIR}/src/core/memory.cpp" \
+            "${SDK_DIR}/src/core/memory_posix.cpp" \
+            "${SDK_DIR}/src/core/mutex.cpp" \
+            "${SDK_DIR}/src/core/ring_buffer.cpp" \
+            "${SDK_DIR}/src/core/seh_posix.cpp" \
+            "${SDK_DIR}/src/core/socket_posix.cpp" \
+            "${SDK_DIR}/src/core/string_buffer.cpp" \
+            "${SDK_DIR}/src/core/system_posix.cpp" \
+            "${SDK_DIR}/src/core/threading.cpp" \
+            "${SDK_DIR}/src/core/threading_posix.cpp" \
+            "${SDK_DIR}/src/core/utf8.cpp" \
+            "${SDK_DIR}/src/core/vec128.cpp" \
+            "${SDK_DIR}/src/core/platform/console_posix.cpp" \
+            "${SDK_DIR}/src/core/platform/env_posix.cpp" \
+            "${SDK_DIR}/src/system/xmemory.cpp" \
+            "${SDK_DIR}/src/system/mmio_handler.cpp" \
+            "${SDK_DIR}/src/graphics/xenos.cpp" \
+            "${SDK_DIR}/src/graphics/flags.cpp" \
+            "${SDK_DIR}/src/graphics/format/ucode.cpp" \
+            "${SDK_DIR}/src/graphics/pipeline/shader/shader.cpp" \
+            "${SDK_DIR}/src/graphics/pipeline/shader/translator.cpp" \
+            "${SDK_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp" \
+            "${SDK_DIR}/src/ui/renderdoc_api.cpp" \
+            -framework Foundation -framework Metal -lpthread \
+            -o build-smoke/ios_smoke_test
+          ./build-smoke/ios_smoke_test --emit-metal build-smoke/metal
+          for mf in build-smoke/metal/*.metal; do
+            echo "Compiling ${mf} with iOS Metal compiler..."
+            xcrun -sdk iphoneos metal -std=metal3.0 -c "${mf}" -o "${mf}.air"
+          done
+
+      - name: Publish IPA to Rolling GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest-ios >/dev/null 2>&1 || \
+            gh release create latest-ios --title "Latest iOS Build" --notes "Rolling unsigned Peggle 2 iOS build" --prerelease
+          gh release upload latest-ios "${GITHUB_WORKSPACE}/Peggle2-iOS.ipa" --clobber
