@@ -3,8 +3,20 @@ name: iOS Build (.ipa)
 on:
   push:
     branches: [ main, master ]
+    paths:
+      - 'peggle2/ios/**'
+      - 'peggle2/src/**'
+      - 'peggle2/generated/**'
+      - 'peggle2/CMakeLists.txt'
+      - '.github/workflows/ios-build.yml'
   pull_request:
     branches: [ main, master ]
+    paths:
+      - 'peggle2/ios/**'
+      - 'peggle2/src/**'
+      - 'peggle2/generated/**'
+      - 'peggle2/CMakeLists.txt'
+      - '.github/workflows/ios-build.yml'
   workflow_dispatch:
 
 permissions:

@@ -66,6 +66,10 @@ REXCVAR_DEFINE_STRING(replay_input, "", "Input",
                       "Path to replay guest input ticks (.rec)");
 REXCVAR_DEFINE_BOOL(locate_game, false, "Paths",
                     "Force Locate Game Data / ISO prompt on startup");
+REXCVAR_DEFINE_STRING(game, "", "Paths",
+                      "Explicit path to Peggle 2 folder, .iso, XBLA container, or Default.xex");
+REXCVAR_DEFINE_STRING(game_path, "", "Paths",
+                      "Saved path to Peggle 2 game source in peggle2.toml");
 REXCVAR_DEFINE_BOOL(test_colliders, false, "Debug",
                     "Run 2D UI collider self-checks and exit");
 
@@ -2245,6 +2249,7 @@ static void EnsureAppWindowIcon() {}
 
 struct LocateGameState {
   std::atomic<bool> active{false};
+  bool mid_session = false;
   rex::PathConfig defaults;
   std::function<void(rex::PathConfig)> resume;
   char path_buf[1024]{};
@@ -2255,6 +2260,9 @@ struct LocateGameState {
 };
 
 static LocateGameState g_locate_state;
+static std::filesystem::path g_active_config_path;
+static std::string g_cli_positional_game;
+static std::filesystem::path g_active_game_source;
 
 static bool EqualsCaseInsensitive(std::string_view a, std::string_view b) {
   if (a.size() != b.size()) return false;
@@ -2284,6 +2292,71 @@ static bool HasExtractedGameFiles(const std::filesystem::path& dir) {
   return false;
 }
 
+static bool IsXboxIsoFile(const std::filesystem::path& p) {
+  std::error_code ec;
+  if (p.empty() || !std::filesystem::is_regular_file(p, ec) ||
+      !EqualsCaseInsensitive(p.extension().string(), ".iso")) {
+    return false;
+  }
+  std::ifstream f(p, std::ios::binary);
+  if (!f.is_open()) return false;
+  static constexpr uint64_t kGdfxOffsets[] = {
+      0x00000000ULL, 0x0000FB20ULL, 0x00020600ULL, 0x02080000ULL, 0x0FD90000ULL,
+  };
+  static constexpr char kGdfxMagic[] = "MICROSOFT*XBOX*MEDIA";
+  char buf[20]{};
+  for (uint64_t off : kGdfxOffsets) {
+    f.clear();
+    f.seekg(static_cast<std::streamoff>(off + 32ULL * 2048ULL), std::ios::beg);
+    if (f.read(buf, sizeof(buf)) && std::memcmp(buf, kGdfxMagic, sizeof(buf)) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsStfsContainerFile(const std::filesystem::path& p) {
+  std::error_code ec;
+  if (p.empty() || !std::filesystem::is_regular_file(p, ec)) return false;
+  std::ifstream f(p, std::ios::binary);
+  char magic[4]{};
+  if (!f.read(magic, 4)) return false;
+  return std::memcmp(magic, "LIVE", 4) == 0 ||
+         std::memcmp(magic, "PIRS", 4) == 0 ||
+         std::memcmp(magic, "CON ", 4) == 0;
+}
+
+static std::filesystem::path NormalizeGameSourceCandidate(std::filesystem::path p) {
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(p, ec) &&
+      EqualsCaseInsensitive(p.filename().string(), "default.xex")) {
+    return p.parent_path();
+  }
+  return p;
+}
+
+static bool IsValidGameDataPath(const std::filesystem::path& p) {
+  if (p.empty()) return false;
+  if (HasExtractedGameFiles(p)) return true;
+  if (IsXboxIsoFile(p)) return true;
+  return IsStfsContainerFile(p);
+}
+
+static std::filesystem::path FindValidGameInFolder(const std::filesystem::path& dir) {
+  std::error_code ec;
+  if (dir.empty() || !std::filesystem::is_directory(dir, ec)) return {};
+  if (HasExtractedGameFiles(dir)) return dir;
+  std::vector<std::filesystem::path> files;
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (entry.is_regular_file(ec)) files.push_back(entry.path());
+  }
+  std::sort(files.begin(), files.end());
+  for (const auto& fp : files) {
+    if (IsXboxIsoFile(fp) || IsStfsContainerFile(fp)) return fp;
+  }
+  return {};
+}
+
 static void ValidateLocatePath(LocateGameState& st) {
   std::string raw(st.path_buf);
   while (!raw.empty() && (raw.front() == ' ' || raw.front() == '"' || raw.front() == '\t')) raw.erase(raw.begin());
@@ -2292,7 +2365,7 @@ static void ValidateLocatePath(LocateGameState& st) {
   st.valid = false;
   st.resolved_path.clear();
   if (raw.empty()) {
-    st.status = "Select your Peggle 2 .iso, default.xex, or extracted game folder.";
+    st.status = "Select your Peggle 2 extracted folder, .iso, XBLA container, or Default.xex.";
     return;
   }
 
@@ -2304,19 +2377,21 @@ static void ValidateLocatePath(LocateGameState& st) {
     if (EqualsCaseInsensitive(fname, "default.xex")) {
       p = p.parent_path();
     } else if (EqualsCaseInsensitive(ext, ".iso")) {
+      if (IsXboxIsoFile(p)) {
+        st.valid = true;
+        st.resolved_path = std::filesystem::absolute(p, ec);
+        st.status = "Valid Xbox 360 ISO image ready.";
+      } else {
+        st.status = "File does not contain a valid Xbox 360 GDFX header.";
+      }
+      return;
+    } else if (IsStfsContainerFile(p)) {
       st.valid = true;
       st.resolved_path = std::filesystem::absolute(p, ec);
-      st.status = "Valid Xbox 360 ISO image ready.";
+      st.status = "Valid Xbox 360 XBLA STFS container ready.";
       return;
     } else {
-      std::ifstream f(p, std::ios::binary);
-      char magic[4] = {};
-      if (f.read(magic, 4) &&
-          (std::memcmp(magic, "LIVE", 4) == 0 || std::memcmp(magic, "PIRS", 4) == 0 || std::memcmp(magic, "CON ", 4) == 0)) {
-        st.status = "STFS XBLA container detected (LIVE/PIRS/CON). Extract it first via tools/stfs_extract.py, then pick the output folder.";
-      } else {
-        st.status = "Unsupported file. Pick a .iso image, default.xex, or an extracted game folder.";
-      }
+      st.status = "Unsupported file. Pick a .iso, XBLA container, Default.xex, or game folder.";
       return;
     }
   }
@@ -2342,32 +2417,25 @@ static std::string WideToUtf8(const std::wstring& w) {
   return out;
 }
 
-static bool BrowseForGameFile(HWND owner, std::string& out_path) {
-  wchar_t file_buf[1024]{};
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = owner;
-  ofn.lpstrFilter = L"Peggle 2 Game Files (*.iso;default.xex)\0*.iso;default.xex;Default.xex\0All Files (*.*)\0*.*\0";
-  ofn.lpstrFile = file_buf;
-  ofn.nMaxFile = 1024;
-  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-  ofn.lpstrTitle = L"Locate Peggle 2 ISO or default.xex";
-  if (GetOpenFileNameW(&ofn)) {
-    out_path = WideToUtf8(file_buf);
-    return true;
-  }
-  return false;
-}
-
-static bool BrowseForGameFolder(HWND owner, std::string& out_path) {
+static bool RunWin32FileOpenDialog(HWND owner, bool pick_folder, const wchar_t* title,
+                                   std::string& out_path) {
   HRESULT hr_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   IFileOpenDialog* dlg = nullptr;
   bool picked = false;
   if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
     DWORD opts = 0;
     dlg->GetOptions(&opts);
-    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
-    dlg->SetTitle(L"Select Extracted Peggle 2 Game Folder");
+    dlg->SetOptions(opts | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR |
+                    (pick_folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+    if (!pick_folder) {
+      static constexpr COMDLG_FILTERSPEC kSpecs[] = {
+          {L"Peggle 2 Game Files (*.iso; Default.xex; XBLA)", L"*.iso;default.xex;Default.xex;*.*"},
+          {L"All Files (*.*)", L"*.*"},
+      };
+      dlg->SetFileTypes(2, kSpecs);
+      dlg->SetFileTypeIndex(1);
+    }
+    dlg->SetTitle(title);
     if (SUCCEEDED(dlg->Show(owner))) {
       IShellItem* item = nullptr;
       if (SUCCEEDED(dlg->GetResult(&item))) {
@@ -2385,13 +2453,42 @@ static bool BrowseForGameFolder(HWND owner, std::string& out_path) {
   if (SUCCEEDED(hr_init)) CoUninitialize();
   return picked;
 }
+
+static bool BrowseForGameFile(HWND owner, std::string& out_path) {
+  return RunWin32FileOpenDialog(owner, false,
+                                L"Select Peggle 2 .ISO, XBLA Container, or Default.xex",
+                                out_path);
+}
+
+static bool BrowseForGameFolder(HWND owner, std::string& out_path) {
+  return RunWin32FileOpenDialog(owner, true, L"Select Extracted Peggle 2 Game Folder", out_path);
+}
+
+static void RestartWindowsAppWithToml() {
+  wchar_t exe_path[MAX_PATH]{};
+  if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) == 0) return;
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (CreateProcessW(exe_path, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    std::exit(0);
+  }
+}
 #endif
 
 static void SaveGameDataRootToToml(const std::filesystem::path& config_path,
                                    const std::filesystem::path& game_path) {
   if (config_path.empty()) return;
   std::string normalized = game_path.generic_string();
-  std::string new_line = "game_data_root = \"" + normalized + "\"";
+#if REX_PLATFORM_IOS
+  const char* primary_key = "game_data_root";
+#else
+  const char* primary_key = "game_path";
+  rex::cvar::SetFlagByName("game_path", normalized);
+#endif
+  std::string new_line = std::string(primary_key) + " = \"" + normalized + "\"";
   std::vector<std::string> lines;
   {
     std::ifstream in(config_path);
@@ -2400,7 +2497,10 @@ static void SaveGameDataRootToToml(const std::filesystem::path& config_path,
     while (std::getline(in, line)) {
       std::string trimmed = line;
       while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
-      if (trimmed.rfind("game_data_root", 0) == 0 && trimmed.find('=') != std::string::npos) {
+      const bool is_game_key =
+          ((trimmed.rfind("game_path", 0) == 0 || trimmed.rfind("game_data_root", 0) == 0) &&
+           trimmed.find('=') != std::string::npos);
+      if (is_game_key) {
         if (!replaced) {
           lines.push_back(new_line);
           replaced = true;
@@ -2664,9 +2764,9 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
     }
     ImGui::End();
 #else
-    if (ImGui::Begin("Locate Your Peggle 2 ISO / Game Data", nullptr,
+    if (ImGui::Begin("Locate Your Peggle 2 Game Source", nullptr,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize)) {
-      ImGui::TextWrapped("Bring your own copy of Peggle 2 (Xbox 360). Point to a .iso image or an extracted folder containing Default.xex.");
+      ImGui::TextWrapped("Bring your own copy of Peggle 2 (Xbox 360). Choose an extracted folder containing Default.xex, or pick a .iso / XBLA STFS / Default.xex file.");
       ImGui::Spacing();
       ImGui::SetNextItemWidth(-1.0f);
       if (ImGui::InputText("##locate_path", g_locate_state.path_buf, sizeof(g_locate_state.path_buf))) {
@@ -2674,17 +2774,17 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
       }
       ImGui::Spacing();
 #ifdef _WIN32
-      if (ImGui::Button("Browse ISO / XEX...")) {
+      if (ImGui::Button("Browse Folder...")) {
         std::string picked;
-        if (BrowseForGameFile(EnsureAppWindowIcon(), picked)) {
+        if (BrowseForGameFolder(EnsureAppWindowIcon(), picked)) {
           snprintf(g_locate_state.path_buf, sizeof(g_locate_state.path_buf), "%s", picked.c_str());
           ValidateLocatePath(g_locate_state);
         }
       }
       ImGui::SameLine();
-      if (ImGui::Button("Browse Folder...")) {
+      if (ImGui::Button("Browse ISO / XEX / XBLA...")) {
         std::string picked;
-        if (BrowseForGameFolder(EnsureAppWindowIcon(), picked)) {
+        if (BrowseForGameFile(EnsureAppWindowIcon(), picked)) {
           snprintf(g_locate_state.path_buf, sizeof(g_locate_state.path_buf), "%s", picked.c_str());
           ValidateLocatePath(g_locate_state);
         }
@@ -2697,12 +2797,18 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
       ImGui::Spacing();
 
       ImGui::BeginDisabled(!g_locate_state.valid);
-      if (ImGui::Button("Launch Game", ImVec2(140, 0))) {
+      if (ImGui::Button(g_locate_state.mid_session ? "Save & Restart" : "Launch Game",
+                        ImVec2(150, 0))) {
         do_launch = true;
       }
       ImGui::EndDisabled();
       ImGui::SameLine();
-      if (ImGui::Button("Quit", ImVec2(100, 0))) {
+      if (g_locate_state.mid_session) {
+        if (ImGui::Button("Cancel", ImVec2(100, 0))) {
+          g_locate_state.active.store(false, std::memory_order_release);
+          g_locate_state.mid_session = false;
+        }
+      } else if (ImGui::Button("Quit", ImVec2(100, 0))) {
 #ifdef _WIN32
         if (HWND hwnd = EnsureAppWindowIcon()) {
           PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -2720,11 +2826,22 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
     if (do_launch) {
       rex::PathConfig next_paths = g_locate_state.defaults;
       next_paths.game_data_root = g_locate_state.resolved_path;
-      SaveGameDataRootToToml(next_paths.config_path, next_paths.game_data_root);
-      auto resume_cb = std::move(g_locate_state.resume);
-      g_locate_state.active.store(false, std::memory_order_release);
-      if (resume_cb) {
-        resume_cb(std::move(next_paths));
+      const std::filesystem::path cfg_out =
+          !next_paths.config_path.empty() ? next_paths.config_path : g_active_config_path;
+      SaveGameDataRootToToml(cfg_out, next_paths.game_data_root);
+      if (g_locate_state.mid_session) {
+        g_locate_state.active.store(false, std::memory_order_release);
+        g_locate_state.mid_session = false;
+#ifdef _WIN32
+        RestartWindowsAppWithToml();
+#endif
+      } else {
+        g_active_game_source = next_paths.game_data_root;
+        auto resume_cb = std::move(g_locate_state.resume);
+        g_locate_state.active.store(false, std::memory_order_release);
+        if (resume_cb) {
+          resume_cb(std::move(next_paths));
+        }
       }
     }
   }
@@ -3164,6 +3281,18 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
           SaveGameDataRootToToml(cfg, std::filesystem::path(chosen_path));
         });
       }
+#elif defined(_WIN32)
+      ImGui::SameLine();
+      if (ImGui::Button("Change Game Source")) {
+        g_menu_open.store(false, std::memory_order_relaxed);
+        g_locate_state.mid_session = true;
+        g_locate_state.defaults.config_path =
+            !g_active_config_path.empty() ? g_active_config_path : (GetExeDirectory() / "peggle2.toml");
+        std::string cur = g_active_game_source.string();
+        snprintf(g_locate_state.path_buf, sizeof(g_locate_state.path_buf), "%s", cur.c_str());
+        g_locate_state.needs_validate = true;
+        g_locate_state.active.store(true, std::memory_order_release);
+      }
 #endif
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(0.65f, 0.90f, 0.65f, 1.0f), "(Auto-saved to peggle2_settings.ini)");
@@ -3308,72 +3437,68 @@ void Peggle2App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   }
 }
 
-static bool IsStfsContainerFile(const std::filesystem::path& p) {
-  std::error_code ec;
-  if (p.empty() || !std::filesystem::is_regular_file(p, ec)) return false;
-  std::ifstream f(p, std::ios::binary);
-  char magic[4]{};
-  if (!f.read(magic, 4)) return false;
-  return std::memcmp(magic, "LIVE", 4) == 0 ||
-         std::memcmp(magic, "PIRS", 4) == 0 ||
-         std::memcmp(magic, "CON ", 4) == 0;
-}
-
-static bool IsValidGameDataPath(const std::filesystem::path& p) {
-  std::error_code ec;
-  if (p.empty()) return false;
-  if (HasExtractedGameFiles(p)) return true;
-  if (std::filesystem::is_regular_file(p, ec) &&
-      EqualsCaseInsensitive(p.extension().string(), ".iso")) {
-    return true;
-  }
-  return IsStfsContainerFile(p);
-}
-
 static std::filesystem::path ResolveGameDataFolder(const std::filesystem::path& requested) {
-  auto is_valid = [](const std::filesystem::path& p) -> bool {
-    return IsValidGameDataPath(p);
+  auto check_candidate = [](const std::filesystem::path& raw,
+                            std::filesystem::path& out) -> bool {
+    if (raw.empty()) return false;
+    std::error_code ec;
+    const std::filesystem::path norm = NormalizeGameSourceCandidate(raw);
+    if (IsValidGameDataPath(norm)) {
+      out = std::filesystem::absolute(norm, ec);
+      return true;
+    }
+    if (auto found = FindValidGameInFolder(norm); !found.empty()) {
+      out = std::filesystem::absolute(found, ec);
+      return true;
+    }
+    return false;
   };
 
 #if REX_PLATFORM_IOS
   // iOS resolution order: (a) Documents/game/, (b) Peggle2GameBookmark, (c) bundle assets/.
   if (const std::string ios_src = rex_ios_resolve_startup_game_source(); !ios_src.empty()) {
     std::filesystem::path p(ios_src);
-    if (is_valid(p)) return p;
+    if (IsValidGameDataPath(p)) return p;
   }
-  if (is_valid(requested)) return std::filesystem::absolute(requested);
+  if (IsValidGameDataPath(requested)) return std::filesystem::absolute(requested);
   return {};
 #else
-  // 1. Configured/CLI path first
-  if (is_valid(requested)) return std::filesystem::absolute(requested);
+  std::filesystem::path resolved;
+  const std::filesystem::path cwd = std::filesystem::current_path();
+  const std::filesystem::path exe_dir = GetExeDirectory();
 
-  std::string cvar_path = REXCVAR_GET(game_data_root);
-  if (!cvar_path.empty()) {
-    if (is_valid(cvar_path)) return std::filesystem::absolute(cvar_path);
-    auto cwd = std::filesystem::current_path();
-    if (is_valid(cwd / cvar_path)) return std::filesystem::absolute(cwd / cvar_path);
-    auto exe_dir = GetExeDirectory();
-    if (is_valid(exe_dir / cvar_path)) return std::filesystem::absolute(exe_dir / cvar_path);
+  // (a) Explicit CLI argument (--game, drag-and-drop positional, or runtime override)
+  if (check_candidate(requested, resolved)) return resolved;
+  if (const std::string cli_game = REXCVAR_GET(game); !cli_game.empty()) {
+    if (check_candidate(cli_game, resolved)) return resolved;
+    if (check_candidate(cwd / cli_game, resolved)) return resolved;
+    if (check_candidate(exe_dir / cli_game, resolved)) return resolved;
+  }
+  if (!g_cli_positional_game.empty()) {
+    if (check_candidate(g_cli_positional_game, resolved)) return resolved;
+    if (check_candidate(cwd / g_cli_positional_game, resolved)) return resolved;
+    if (check_candidate(exe_dir / g_cli_positional_game, resolved)) return resolved;
   }
 
-  // 2. Current working directory
-  auto cwd = std::filesystem::current_path();
-  if (is_valid(cwd)) return cwd;
-  if (is_valid(cwd / "game")) return cwd / "game";
-
-  // 3. Exe directory
-  auto exe_dir = GetExeDirectory();
-  if (is_valid(exe_dir)) return exe_dir;
-  if (is_valid(exe_dir / "game")) return exe_dir / "game";
-  if (is_valid(exe_dir / ".." / ".." / ".." / "game")) {
-    return std::filesystem::weakly_canonical(exe_dir / ".." / ".." / ".." / "game");
+  // (b) Saved game_path (or legacy game_data_root) in peggle2.toml
+  for (const std::string& toml_val : {REXCVAR_GET(game_path), REXCVAR_GET(game_data_root)}) {
+    if (toml_val.empty()) continue;
+    if (check_candidate(toml_val, resolved)) return resolved;
+    if (check_candidate(cwd / toml_val, resolved)) return resolved;
+    if (check_candidate(exe_dir / toml_val, resolved)) return resolved;
   }
 
-  // 4. Known fallback project path
-  if (is_valid("C:/Peggle2Recomp/game")) return "C:/Peggle2Recomp/game";
-  if (is_valid("C:/Peggle2Recomp")) return "C:/Peggle2Recomp";
+  // (c) Local ./game/ folder next to peggle2.exe (plus dev workspace fallbacks)
+  if (check_candidate(exe_dir / "game", resolved)) return resolved;
+  if (check_candidate(cwd / "game", resolved)) return resolved;
+  if (check_candidate(exe_dir, resolved)) return resolved;
+  if (check_candidate(cwd, resolved)) return resolved;
+  if (check_candidate(exe_dir / ".." / ".." / ".." / "game", resolved)) {
+    return std::filesystem::weakly_canonical(resolved);
+  }
+  if (check_candidate("C:/Peggle2Recomp/game", resolved)) return resolved;
 
-  return requested;
+  return {};
 #endif
 }
 
@@ -3427,6 +3552,9 @@ static std::filesystem::path ResolveConfigPath(const std::filesystem::path& requ
 
 void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   ArmStartupEnvWatchdogOnce();
+  if (auto drag_arg = GetArgument("game"); drag_arg && !drag_arg->empty()) {
+    g_cli_positional_game = *drag_arg;
+  }
   if (IsEnvFlagEnabled("PEGGLE_TEST_COLLIDERS") || REXCVAR_GET(test_colliders) ||
       HasCmdFlag("--test_colliders")) {
     const bool tc_log = IsEnvFlagEnabled("PEGGLE_TEST_COLLIDERS");
@@ -3453,6 +3581,10 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   }
 #endif
   paths.config_path = ResolveConfigPath(paths.config_path);
+  if (paths.config_path.empty()) {
+    paths.config_path = GetExeDirectory() / "peggle2.toml";
+  }
+  g_active_config_path = paths.config_path;
   if (std::filesystem::exists(paths.config_path)) {
     rex::cvar::LoadConfig(paths.config_path);
   }
@@ -3515,9 +3647,11 @@ std::optional<rex::PathConfig> Peggle2App::OnFinalizePaths(const rex::PathConfig
     resolved.config_path = GetExeDirectory() / "peggle2.toml";
 #endif
   }
+  g_active_config_path = resolved.config_path;
   resolved.game_data_root = ResolveGameDataFolder(resolved.game_data_root);
 
   if (REXCVAR_GET(locate_game) || !IsValidGameDataPath(resolved.game_data_root)) {
+    g_locate_state.mid_session = false;
     g_locate_state.defaults = resolved;
     g_locate_state.resume = std::move(resume);
     std::string initial = resolved.game_data_root.string();
@@ -3540,6 +3674,7 @@ std::optional<rex::PathConfig> Peggle2App::OnFinalizePaths(const rex::PathConfig
 #endif
     return std::nullopt;
   }
+  g_active_game_source = resolved.game_data_root;
 #if REX_PLATFORM_IOS
   rex_ios_init_vfs_case_map_for_path(resolved.game_data_root.string());
 #endif

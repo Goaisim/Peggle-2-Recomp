@@ -8,7 +8,11 @@
 
 class Peggle2App : public rex::ReXApp {
  public:
-  using rex::ReXApp::ReXApp;
+  Peggle2App(rex::ui::WindowedAppContext& ctx, std::string_view name,
+             rex::PPCImageInfo ppc_info)
+      : rex::ReXApp(ctx, name, ppc_info) {
+    AddPositionalOption("game");
+  }
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(
       rex::ui::WindowedAppContext& ctx) {

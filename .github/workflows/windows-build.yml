@@ -1,0 +1,241 @@
+name: Windows Build (x64)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'peggle2/src/**'
+      - 'peggle2/resources/**'
+      - 'peggle2/generated/**'
+      - 'peggle2/CMakeLists.txt'
+      - 'peggle2/CMakePresets.json'
+      - 'peggle2/peggle2.toml'
+      - 'peggle2/peggle2_functions.toml'
+      - 'peggle2/peggle2_manifest.toml'
+      - 'peggle2/ios/rexglue-sdk.patch'
+      - '.github/workflows/windows-build.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'peggle2/src/**'
+      - 'peggle2/resources/**'
+      - 'peggle2/generated/**'
+      - 'peggle2/CMakeLists.txt'
+      - 'peggle2/CMakePresets.json'
+      - 'peggle2/peggle2.toml'
+      - 'peggle2/peggle2_functions.toml'
+      - 'peggle2/peggle2_manifest.toml'
+      - 'peggle2/ios/rexglue-sdk.patch'
+      - '.github/workflows/windows-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x64:
+    name: Build Asset-Free Peggle2-Windows-x64.zip
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup MSVC x64, Ninja, and LLVM Clang toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio x64 build tools not found" }
+
+          $devCmd = Join-Path $vsPath "Common7\Tools\VsDevCmd.bat"
+          $envDump = cmd /c "`"$devCmd`" -arch=amd64 -host_arch=amd64 -no_logo && set"
+          foreach ($line in $envDump) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $k = $matches[1]; $v = $matches[2]
+              if ($k -ieq 'PATH') {
+                $v -split ';' | Where-Object { $_ -and (Test-Path $_) } | ForEach-Object {
+                  Add-Content -Path $env:GITHUB_PATH -Value $_
+                }
+              } elseif ($k -in @('INCLUDE','LIB','LIBPATH','VCToolsInstallDir','VCToolsRedistDir','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion')) {
+                Add-Content -Path $env:GITHUB_ENV -Value "$k=$v"
+              }
+            }
+          }
+
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path (Join-Path $llvmBin "clang++.exe"))) {
+            $vsLlvm = Join-Path $vsPath "VC\Tools\Llvm\x64\bin"
+            if (Test-Path (Join-Path $vsLlvm "clang++.exe")) {
+              $llvmBin = $vsLlvm
+            } else {
+              throw "clang++.exe not found on runner"
+            }
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+          $env:PATH = "$llvmBin;$env:PATH"
+          clang++ --version
+          cmake --version
+          ninja --version
+
+      - name: Cache ReXGlue SDK Windows x64 install
+        id: sdk-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}\rexglue-sdk-install
+          key: ${{ runner.os }}-x64-rexglue-f5337cd-${{ hashFiles('peggle2/ios/rexglue-sdk.patch') }}
+
+      - name: Build & install ReXGlue SDK with patch
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkDir = Join-Path $env:RUNNER_TEMP "rexglue-sdk"
+          $sdkBuild = Join-Path $env:RUNNER_TEMP "rexglue-sdk-build"
+          $sdkInstall = Join-Path $env:RUNNER_TEMP "rexglue-sdk-install"
+          $patchFile = Join-Path $env:GITHUB_WORKSPACE "peggle2\ios\rexglue-sdk.patch"
+          $baseCommit = "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
+
+          Remove-Item -Recurse -Force $sdkDir, $sdkBuild, $sdkInstall -ErrorAction SilentlyContinue
+          git clone https://github.com/rexglue/rexglue-sdk.git $sdkDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $sdkDir checkout $baseCommit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $sdkDir submodule update --init --jobs 8 `
+            thirdparty/cli11 `
+            thirdparty/libmspack `
+            thirdparty/FFmpeg `
+            thirdparty/tomlplusplus `
+            thirdparty/simde `
+            thirdparty/xxHash `
+            thirdparty/spdlog `
+            thirdparty/fmt `
+            thirdparty/utfcpp `
+            thirdparty/imgui `
+            thirdparty/sdl3 `
+            thirdparty/o1heap `
+            thirdparty/tracy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $sdkDir apply --check $patchFile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $sdkDir apply $patchFile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake -S $sdkDir -B $sdkBuild -G "Ninja Multi-Config" `
+            -DCMAKE_C_COMPILER=clang `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_FLAGS="-march=x86-64-v3" `
+            -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
+            -DCMAKE_INSTALL_PREFIX="$sdkInstall"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --build $sdkBuild --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --install $sdkBuild --config Release --prefix "$sdkInstall"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify generated recompiled guest sources exist
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "peggle2\generated\default\sources.cmake")) {
+            Write-Error "peggle2/generated/default/sources.cmake not found."
+            exit 1
+          }
+
+      - name: Configure & build peggle2.exe (Release x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkInstall = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-install") -replace '\\', '/'
+          if (-not (Test-Path "$sdkInstall/lib/cmake/rexglue/rexglueConfig.cmake")) {
+            throw "rexglueConfig.cmake missing in $sdkInstall"
+          }
+
+          # Remove stale local codegen depfile and refresh generated stamps so Ninja uses committed C++ sources.
+          Remove-Item -Force "peggle2\generated\default\codegen.d" -ErrorAction SilentlyContinue
+          $now = Get-Date
+          Get-ChildItem "peggle2\generated\default\*" -File | ForEach-Object { $_.LastWriteTime = $now }
+
+          cmake -S peggle2 -B build-win -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_FLAGS="-march=x86-64-v3" `
+            -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
+            -DCMAKE_PREFIX_PATH="$sdkInstall" `
+            -Drexglue_DIR="$sdkInstall/lib/cmake/rexglue"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --build build-win --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage asset-free Peggle2-Windows-x64.zip & audit contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $env:GITHUB_WORKSPACE "win_stage"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "Peggle2-Windows-x64.zip"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          Copy-Item "build-win\peggle2.exe" $stage
+          Get-ChildItem "build-win\*.dll" | Copy-Item -Destination $stage
+
+          # Include standard VC++ x64 CRT DLLs if present so clean Windows installs launch out of the box.
+          if ($env:VCToolsRedistDir) {
+            $crtDir = Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"
+            if (Test-Path $crtDir) {
+              foreach ($dll in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_atomic_wait.dll")) {
+                $src = Join-Path $crtDir $dll
+                if (Test-Path $src) { Copy-Item $src $stage }
+              }
+            }
+          }
+
+          Copy-Item "peggle2\peggle2.toml" (Join-Path $stage "peggle2.toml")
+
+          # Assert zero retail files and zero hardcoded local paths in staged output.
+          $bannedExts = @(".xex",".iso",".rsb",".pak",".bik",".xma",".stfs",".xbla")
+          $tomlContent = Get-Content (Join-Path $stage "peggle2.toml") -Raw
+          if ($tomlContent -match 'C:|D:|game_data_root|game_path') {
+            throw "peggle2.toml must not contain hardcoded local paths: $tomlContent"
+          }
+          Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            if ($bannedExts -contains $_.Extension.ToLowerInvariant()) {
+              throw "Forbidden retail asset found in stage: $($_.FullName)"
+            }
+          }
+
+          Compress-Archive -Path "$stage\*" -DestinationPath $zipPath -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            Write-Host "Packaged entries in Peggle2-Windows-x64.zip:"
+            foreach ($entry in $zip.Entries) {
+              Write-Host ("  {0} ({1} bytes)" -f $entry.FullName, $entry.Length)
+              $ext = [System.IO.Path]::GetExtension($entry.FullName).ToLowerInvariant()
+              if ($bannedExts -contains $ext) {
+                throw "Forbidden retail asset found inside zip: $($entry.FullName)"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+      - name: Publish ZIP to Rolling GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          gh release view latest-windows *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create latest-windows --title "Latest Windows Build" --notes "Rolling asset-free Peggle 2 Windows x64 build" --prerelease
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          gh release upload latest-windows "${env:GITHUB_WORKSPACE}\Peggle2-Windows-x64.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
