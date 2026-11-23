@@ -226,5 +226,7 @@ const char* rex_ios_get_thermal_state_name();
 uint64_t rex_ios_get_guest_frame_seq();
 void rex_ios_wait_for_metal_idle();
 void rex_ios_audio_set_paused(bool paused);
+void rex_ios_set_low_power_auto_scale_enabled(bool enabled);
+bool rex_ios_is_low_power_075x_active();
 
 #endif

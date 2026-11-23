@@ -224,10 +224,17 @@ static std::atomic<int> g_opt_menu_mode{kMenuClickToTarget};  // Default: Click-
 static std::atomic<int> g_opt_sens{kSensMedium};            // Default: Medium
 static std::atomic<int> g_opt_mouse_swap{kSwapAuto};        // Default: Auto (Windows SM_SWAPBUTTON)
 static std::atomic<int> g_opt_touch_controls{kTouchControlsShow};  // Show corner A/B/Start strip
+#if REX_PLATFORM_IOS
+static std::atomic<int> g_opt_low_power_scale{1};  // Auto 0.75x in Low Power Mode / Serious thermal
+#endif
 
 static std::atomic<bool> g_menu_open{false};
 static int g_selected_menu_item = 0;
+#if REX_PLATFORM_IOS
+constexpr int kMenuItemCount = 15;
+#else
 constexpr int kMenuItemCount = 14;
+#endif
 
 // Corner touch strip (A / B / Start) + HUD toggle exclusion rect state shared with XInput hook.
 static std::atomic<uint16_t> g_ios_corner_held_mask{0};
@@ -283,6 +290,9 @@ static const SettingEntry kSettingEntries[kMenuItemCount] = {
   { "sens",          &g_opt_sens,           kSensMedium,           kSensCount },
   { "mouse_swap",    &g_opt_mouse_swap,     kSwapAuto,             kSwapCount },
   { "touch_buttons", &g_opt_touch_controls, kTouchControlsShow,    kTouchControlsCount },
+#if REX_PLATFORM_IOS
+  { "low_power_scale", &g_opt_low_power_scale, 1,                  2 },
+#endif
 };
 
 static std::filesystem::path g_settings_ini_path;
@@ -2130,12 +2140,25 @@ extern "C" REX_FUNC(sub_8261FE50) {
   }
 
   int tex_idx = g_opt_tex.load(std::memory_order_relaxed);
-  if (last_synced_tex != tex_idx) {
-    rex::cvar::SetFlagByName("texture_upscale_mode", std::to_string(tex_idx));
-    if (tex_idx == 0) {
+#if REX_PLATFORM_IOS
+  rex_ios_set_low_power_auto_scale_enabled(
+      g_opt_low_power_scale.load(std::memory_order_relaxed) != 0);
+  const bool lp_075 = rex_ios_is_low_power_075x_active();
+  static bool s_last_lp_075 = false;
+  if (lp_075 != s_last_lp_075) {
+    last_synced_tex = -1;
+    s_last_lp_075 = lp_075;
+  }
+  const int effective_tex_idx = lp_075 ? 0 : tex_idx;
+#else
+  const int effective_tex_idx = tex_idx;
+#endif
+  if (last_synced_tex != effective_tex_idx) {
+    rex::cvar::SetFlagByName("texture_upscale_mode", std::to_string(effective_tex_idx));
+    if (effective_tex_idx == 0) {
       rex::cvar::SetFlagByName("present_effect", "bilinear");
       rex::cvar::SetFlagByName("present_cas_additional_sharpness", "0.0");
-    } else if (tex_idx == 1) {
+    } else if (effective_tex_idx == 1) {
       rex::cvar::SetFlagByName("present_effect", "cas");
       rex::cvar::SetFlagByName("present_cas_additional_sharpness", "0.85");
     } else {
@@ -2143,7 +2166,7 @@ extern "C" REX_FUNC(sub_8261FE50) {
       rex::cvar::SetFlagByName("present_cas_additional_sharpness", "1.0");
     }
     rex::ui::Presenter::RefreshGuestOutputPaintConfig();
-    last_synced_tex = tex_idx;
+    last_synced_tex = effective_tex_idx;
   }
 
   int audio_idx = g_opt_audio.load(std::memory_order_relaxed);
@@ -2575,9 +2598,11 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
     if (g_opt_ui_colliders.load(std::memory_order_relaxed) == kCollidersOn) {
       DrawUiColliderOverlay(io);
     }
-    const rex::RexBootTelemetrySnapshot boot_tel = rex::GetBootTelemetrySnapshot();
-    const char* crash_sym = UpdateCrashDiagnostics(boot_tel);
-    DrawTelemetryHud(io, boot_tel, crash_sym);
+    if (g_opt_hud.load(std::memory_order_relaxed) != kHudHidden) {
+      const rex::RexBootTelemetrySnapshot boot_tel = rex::GetBootTelemetrySnapshot();
+      const char* crash_sym = UpdateCrashDiagnostics(boot_tel);
+      DrawTelemetryHud(io, boot_tel, crash_sym);
+    }
     DrawMobileHudToggle(io);
     if (g_menu_open.load(std::memory_order_relaxed)) {
       DrawSettingsMenu(io);
@@ -2915,6 +2940,13 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         case kRes1440p: ren_w = 2560; ren_h = 1440; ren_scale = 2.00f; break;
         case kRes4K:    ren_w = 3840; ren_h = 2160; ren_scale = 3.00f; break;
       }
+#if REX_PLATFORM_IOS
+      if (rex_ios_is_low_power_075x_active()) {
+        ren_w = 960;
+        ren_h = 540;
+        ren_scale = 0.75f;
+      }
+#endif
 
       int aim_mode_hud = g_opt_mouse_aim.load(std::memory_order_relaxed);
       int menu_mode_hud = g_opt_menu_mode.load(std::memory_order_relaxed);
@@ -3259,6 +3291,16 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         g_opt_touch_controls.store((cur + dir + kTouchControlsCount) % kTouchControlsCount,
                                    std::memory_order_relaxed);
       });
+#if REX_PLATFORM_IOS
+      // 15. Automatic 0.75x Render Resolution in Low Power Mode / Thermal Throttle
+      int lp_idx = g_opt_low_power_scale.load(std::memory_order_relaxed);
+      const char* lp_names[2] = { "Off (Native 720p)", "On (Auto 0.75x)" };
+      draw_option(14, "Low Power 0.75x:", lp_names[lp_idx ? 1 : 0], [](int dir) {
+        (void)dir;
+        int cur = g_opt_low_power_scale.load(std::memory_order_relaxed);
+        g_opt_low_power_scale.store(cur ? 0 : 1, std::memory_order_relaxed);
+      });
+#endif
 
       ImGui::Spacing();
       ImGui::Separator();

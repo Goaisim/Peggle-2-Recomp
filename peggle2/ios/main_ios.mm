@@ -802,6 +802,7 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
   layer.contentsScale = [UIScreen mainScreen].nativeScale;
   layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
   layer.framebufferOnly = YES;
+  layer.presentsWithTransaction = NO;
   g_metal_view = _metalView;
   g_metal_layer = layer;
   g_root_vc = self;
@@ -846,19 +847,21 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
 
 - (void)onFrame:(CADisplayLink*)link {
   (void)link;
-  if (rex::IsAppBackgroundPaused()) return;
-  if (g_ios_app_ctx) g_ios_app_ctx->ExecutePendingFunctionsFromUIThread();
-  const uint64_t guest_seq = rex_ios_get_guest_frame_seq();
-  const uint64_t now_ms = TouchNowMs();
-  const bool new_guest_frame = (guest_seq != _lastPresentedGuestSeq);
-  const bool ui_dirty = (now_ms <= g_ui_redraw_until_ms.load(std::memory_order_relaxed)) ||
-                        ((now_ms - _lastPresentedMs) >= 250);
-  if (!new_guest_frame && !ui_dirty) {
-    return;
+  @autoreleasepool {
+    if (rex::IsAppBackgroundPaused()) return;
+    if (g_ios_app_ctx) g_ios_app_ctx->ExecutePendingFunctionsFromUIThread();
+    const uint64_t guest_seq = rex_ios_get_guest_frame_seq();
+    const uint64_t now_ms = TouchNowMs();
+    const bool new_guest_frame = (guest_seq != _lastPresentedGuestSeq);
+    const bool ui_dirty = (now_ms <= g_ui_redraw_until_ms.load(std::memory_order_relaxed)) ||
+                          ((now_ms - _lastPresentedMs) >= 250);
+    if (!new_guest_frame && !ui_dirty) {
+      return;
+    }
+    _lastPresentedGuestSeq = guest_seq;
+    _lastPresentedMs = now_ms;
+    if (g_ios_window) g_ios_window->PaintNow();
   }
-  _lastPresentedGuestSeq = guest_seq;
-  _lastPresentedMs = now_ms;
-  if (g_ios_window) g_ios_window->PaintNow();
 }
 
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -1541,6 +1544,29 @@ static void InstallIosHostCrashHandlers(const std::string& crash_path) {
   }
 }
 
+static std::atomic<bool> g_low_power_auto_scale_enabled{true};
+static std::atomic<bool> g_low_power_mode_active{false};
+static std::atomic<bool> g_thermal_throttle_active{false};
+
+static void UpdatePowerAndThermalState() {
+  NSProcessInfo* pi = [NSProcessInfo processInfo];
+  g_low_power_mode_active.store(pi.isLowPowerModeEnabled ? true : false, std::memory_order_relaxed);
+  g_thermal_throttle_active.store(pi.thermalState >= NSProcessInfoThermalStateSerious,
+                                  std::memory_order_relaxed);
+}
+
+void rex_ios_set_low_power_auto_scale_enabled(bool enabled) {
+  g_low_power_auto_scale_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool rex_ios_is_low_power_075x_active() {
+  if (!g_low_power_auto_scale_enabled.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  return g_low_power_mode_active.load(std::memory_order_relaxed) ||
+         g_thermal_throttle_active.load(std::memory_order_relaxed);
+}
+
 @interface PeggleAppDelegate : UIResponder <UIApplicationDelegate>
 @property(nonatomic, strong) UIWindow* window;
 @property(nonatomic, strong) PeggleViewController* viewController;
@@ -1551,10 +1577,25 @@ static void InstallIosHostCrashHandlers(const std::string& crash_path) {
   std::unique_ptr<rex::ui::WindowedApp> _app;
 }
 
+- (void)onPowerOrThermalChanged:(NSNotification*)note {
+  (void)note;
+  UpdatePowerAndThermalState();
+}
+
 - (BOOL)application:(UIApplication*)application
     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
   (void)application;
   (void)launchOptions;
+  UpdatePowerAndThermalState();
+  NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+  [nc addObserver:self
+         selector:@selector(onPowerOrThermalChanged:)
+             name:NSProcessInfoPowerStateDidChangeNotification
+           object:nil];
+  [nc addObserver:self
+         selector:@selector(onPowerOrThermalChanged:)
+             name:NSProcessInfoThermalStateDidChangeNotification
+           object:nil];
 
   // Ensure Documents folder exists so it appears immediately in Files -> On My iPhone -> Peggle 2.
   const std::string docs = rex_ios_get_documents_dir();
@@ -1624,6 +1665,7 @@ static void InstallIosHostCrashHandlers(const std::string& crash_path) {
 
 - (void)applicationWillTerminate:(UIApplication*)application {
   (void)application;
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
   [self pauseRuntime];
   rex_ios_wait_for_metal_idle();
   if (_app) {

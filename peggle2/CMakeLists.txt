@@ -84,7 +84,10 @@ if(APPLE AND IOS)
         target_link_libraries(peggle2_recomp PRIVATE rex::runtime)
         target_precompile_headers(peggle2_recomp PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/peggle2_pch.h")
-        target_compile_options(peggle2_recomp PRIVATE -gline-tables-only $<$<CONFIG:Release>:-O3>)
+        target_compile_options(peggle2_recomp PRIVATE
+            -gline-tables-only
+            $<$<CONFIG:Release>:-O3 -fomit-frame-pointer -mcpu=apple-a12 -flto=thin -ffunction-sections -fdata-sections>
+        )
         target_link_libraries(peggle2 PRIVATE peggle2_recomp)
     endif()
 
@@ -100,7 +103,19 @@ if(APPLE AND IOS)
         REX_BUILD_SHA="${PEGGLE2_GIT_SHA}"
         SIMDE_ENABLE_NATIVE_ALIASES
     )
-    target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:-O3>)
+    target_compile_options(peggle2 PRIVATE
+        $<$<CONFIG:Release>:-O3 -fomit-frame-pointer -mcpu=apple-a12 -flto=thin -ffunction-sections -fdata-sections>
+    )
+    target_link_options(peggle2 PRIVATE
+        $<$<CONFIG:Release>:-flto=thin -Wl,-dead_strip>
+    )
+    foreach(_sdk_tgt IN ITEMS rexruntime rexgpu-xenos rexui rexcore rexaudio rexinput)
+        if(TARGET ${_sdk_tgt})
+            target_compile_options(${_sdk_tgt} PRIVATE
+                $<$<CONFIG:Release>:-O3 -fomit-frame-pointer -mcpu=apple-a12 -flto=thin -ffunction-sections -fdata-sections>
+            )
+        endif()
+    endforeach()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons" AND COMMAND rexglue_embed_metadata)
         rexglue_embed_metadata(peggle2
@@ -197,7 +212,23 @@ else()
     endif()
 
     target_compile_definitions(peggle2 PRIVATE REX_BUILD_SHA="${PEGGLE2_GIT_SHA}")
-    target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:-O3>)
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(TARGET peggle2_recomp)
+            target_compile_options(peggle2_recomp PRIVATE $<$<CONFIG:Release>:-O3 -flto=thin>)
+        endif()
+        target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:-O3 -flto=thin>)
+        target_link_options(peggle2 PRIVATE
+            $<$<CONFIG:Release>:-flto=thin -fuse-ld=lld -Wl,/OPT:REF,/OPT:ICF>)
+    elseif(WIN32 AND MSVC)
+        if(TARGET peggle2_recomp)
+            target_compile_options(peggle2_recomp PRIVATE $<$<CONFIG:Release>:/O2 /Oi /Ot /GL>)
+        endif()
+        target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:/O2 /Oi /Ot /GL>)
+        target_link_options(peggle2 PRIVATE
+            $<$<CONFIG:Release>:LINKER:/LTCG LINKER:/OPT:REF LINKER:/OPT:ICF>)
+    else()
+        target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:-O3>)
+    endif()
 
     if(WIN32)
         target_link_options(peggle2 PRIVATE "LINKER:/MANIFESTUAC:level='asInvoker' uiAccess='false'")

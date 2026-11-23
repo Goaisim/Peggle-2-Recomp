@@ -395,7 +395,7 @@ struct ResolveParams
     uint x0, y0, width, height;
     uint pitchAligned, heightAligned;
     uint destBase, endian, swap, clearValue;
-    uint scale, memSplitByte;
+    uint scaleNum, scaleDen, memSplitByte, pad;
 };
 static uint tiled_2d(uint x, uint y, uint pitch, uint bppLog2)
 {
@@ -427,21 +427,16 @@ kernel void resolve(texture2d<float, access::read> source [[texture(0)]],
     uint x = p.x0 + id.x, y = p.y0 + id.y;
     if (id.x >= p.width || id.y >= p.height || x >= p.pitchAligned || y >= p.heightAligned)
         return;
-    float4 c = float4(0.0);
-    for (uint dy = 0u; dy < p.scale; dy++)
-        for (uint dx = 0u; dx < p.scale; dx++)
-        {
-            uint2 h = uint2(x, y) * p.scale + uint2(dx, dy);
-            float4 v = source.read(h);
-            if (p.swap != 0u)
-                v = v.zyxw;
-            v.a = 1.0;
-            if (h.x < copy.get_width() && h.y < copy.get_height())
-                copy.write(v, h);
-            c += v;
-        }
-    c /= float(p.scale * p.scale);
+    uint sw = max(1u, source.get_width());
+    uint sh = max(1u, source.get_height());
+    uint2 h = uint2(min((x * p.scaleNum) / p.scaleDen, sw - 1u),
+                    min((y * p.scaleNum) / p.scaleDen, sh - 1u));
+    float4 c = source.read(h);
+    if (p.swap != 0u)
+        c = c.zyxw;
     c.a = 1.0;
+    if (h.x < copy.get_width() && h.y < copy.get_height())
+        copy.write(c, h);
     const uint byte_off = p.destBase + tiled_2d(x, y, p.pitchAligned, 2u);
     const uint val = swap_word(pack_float_to_unorm4x8(c), p.endian);
     if (byte_off >= p.memSplitByte) {
@@ -454,10 +449,12 @@ kernel void clear(texture2d<float, access::write> target [[texture(1)]],
                   constant ResolveParams& p [[buffer(1)]],
                   uint2 id [[thread_position_in_grid]])
 {
-    if (id.x < p.width && id.y < p.height)
-        for (uint dy = 0u; dy < p.scale; dy++)
-            for (uint dx = 0u; dx < p.scale; dx++)
-                target.write(unpack_unorm4x8_to_float(p.clearValue), (uint2(p.x0, p.y0) + id) * p.scale + uint2(dx, dy));
+    if (id.x < p.width && id.y < p.height) {
+        uint2 h = uint2(((p.x0 + id.x) * p.scaleNum) / p.scaleDen,
+                        ((p.y0 + id.y) * p.scaleNum) / p.scaleDen);
+        if (h.x < target.get_width() && h.y < target.get_height())
+            target.write(unpack_unorm4x8_to_float(p.clearValue), h);
+    }
 }
 )MSL";
 

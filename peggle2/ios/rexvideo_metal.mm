@@ -72,7 +72,7 @@ struct ResolveParams {
   uint32_t x0, y0, width, height;
   uint32_t pitchAligned, heightAligned;
   uint32_t destBase, endian, swap, clearValue;
-  uint32_t scale, memSplitByte;
+  uint32_t scaleNum, scaleDen, memSplitByte, pad;
 };
 
 static uint32_t SwapWord(uint32_t value, xenos::Endian endian) {
@@ -345,6 +345,10 @@ class MetalImmediateDrawer final : public rex::ui::ImmediateDrawer {
     batch_used_primary_ = false;
     has_batch_vbuf_ = false;
     active_ib_ = nil;
+    cur_pso_ = nil;
+    cur_tex_ = nil;
+    cur_samp_ = nil;
+    has_scissor_ = false;
     if (encoder_) {
       float inv_size[2] = {1.0f / std::max(1.0f, this->coordinate_space_width()),
                            1.0f / std::max(1.0f, this->coordinate_space_height())};
@@ -416,15 +420,34 @@ class MetalImmediateDrawer final : public rex::ui::ImmediateDrawer {
         return;
       }
     }
-    [encoder_ setScissorRect:{sx, sy, sw, sh}];
+    if (!has_scissor_ || sx != cur_sx_ || sy != cur_sy_ || sw != cur_sw_ || sh != cur_sh_) {
+      [encoder_ setScissorRect:{sx, sy, sw, sh}];
+      cur_sx_ = sx;
+      cur_sy_ = sy;
+      cur_sw_ = sw;
+      cur_sh_ = sh;
+      has_scissor_ = true;
+    }
     auto* mtex = static_cast<MetalImmediateTexture*>(draw.texture);
     if (mtex && mtex->texture) {
-      [encoder_ setRenderPipelineState:pso_tex_];
-      [encoder_ setFragmentTexture:mtex->texture atIndex:0];
-      [encoder_ setFragmentSamplerState:samplers_[mtex->linear ? 1 : 0][mtex->repeat ? 1 : 0]
-                                atIndex:0];
+      if (cur_pso_ != pso_tex_) {
+        [encoder_ setRenderPipelineState:pso_tex_];
+        cur_pso_ = pso_tex_;
+      }
+      if (cur_tex_ != mtex->texture) {
+        [encoder_ setFragmentTexture:mtex->texture atIndex:0];
+        cur_tex_ = mtex->texture;
+      }
+      id<MTLSamplerState> samp = samplers_[mtex->linear ? 1 : 0][mtex->repeat ? 1 : 0];
+      if (cur_samp_ != samp) {
+        [encoder_ setFragmentSamplerState:samp atIndex:0];
+        cur_samp_ = samp;
+      }
     } else {
-      [encoder_ setRenderPipelineState:pso_solid_];
+      if (cur_pso_ != pso_solid_) {
+        [encoder_ setRenderPipelineState:pso_solid_];
+        cur_pso_ = pso_solid_;
+      }
     }
     const MTLPrimitiveType pt = (draw.primitive_type == rex::ui::ImmediatePrimitiveType::kLines)
                                     ? MTLPrimitiveTypeLine
@@ -459,6 +482,10 @@ class MetalImmediateDrawer final : public rex::ui::ImmediateDrawer {
 
   void End() override {
     encoder_ = nil;
+    cur_pso_ = nil;
+    cur_tex_ = nil;
+    cur_samp_ = nil;
+    has_scissor_ = false;
     has_batch_vbuf_ = false;
     active_ib_ = nil;
     ui_slot_ = (ui_slot_ + 1) % kUiRingCount;
@@ -480,6 +507,11 @@ class MetalImmediateDrawer final : public rex::ui::ImmediateDrawer {
   id<MTLBuffer> active_ib_ = nil;
   rex::ui::ImmediateDrawBatch batch_{};
   id<MTLRenderCommandEncoder> encoder_ = nil;
+  id<MTLRenderPipelineState> cur_pso_ = nil;
+  id<MTLTexture> cur_tex_ = nil;
+  id<MTLSamplerState> cur_samp_ = nil;
+  bool has_scissor_ = false;
+  uint32_t cur_sx_ = 0, cur_sy_ = 0, cur_sw_ = 0, cur_sh_ = 0;
   uint32_t rt_w_ = 0;
   uint32_t rt_h_ = 0;
 };
@@ -617,67 +649,80 @@ class MetalPresenter final : public rex::ui::Presenter {
   }
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override {
-    if (rex::IsAppBackgroundPaused()) return PaintResult::kNotPresented;
-    CAMetalLayer* layer = layer_;
-    if (!layer) return PaintResult::kNotPresented;
-    id<CAMetalDrawable> drawable = [layer nextDrawable];
-    if (!drawable) return PaintResult::kNotPresented;
+    @autoreleasepool {
+      if (rex::IsAppBackgroundPaused()) return PaintResult::kNotPresented;
+      CAMetalLayer* layer = layer_;
+      if (!layer) return PaintResult::kNotPresented;
+      id<CAMetalDrawable> drawable = [layer nextDrawable];
+      if (!drawable) return PaintResult::kNotPresented;
 
-    id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
-    if (!cmd) return PaintResult::kNotPresented;
-    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = drawable.texture;
-    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+      id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
+      if (!cmd) return PaintResult::kNotPresented;
+      const uint32_t dw = uint32_t(drawable.texture.width);
+      const uint32_t dh = uint32_t(drawable.texture.height);
 
-    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-    const uint32_t dw = uint32_t(drawable.texture.width);
-    const uint32_t dh = uint32_t(drawable.texture.height);
+      id<MTLTexture> fb = nil;
+      id<MTLTexture> lut = nil;
+      uint32_t fb_w = 0, fb_h = 0;
+      float uv[2] = {1.0f, 1.0f};
+      {
+        std::lock_guard<std::mutex> lock(fb_mutex_);
+        fb = guest_fb_ ? guest_fb_ : (g_guest_frame_tex ? g_guest_frame_tex : g_guest_frontbuffer_mtl);
+        lut = gamma_lut_ ? gamma_lut_ : default_gamma_;
+        fb_w = guest_fb_w_ ? guest_fb_w_ : (fb ? uint32_t(fb.width) : 0u);
+        fb_h = guest_fb_h_ ? guest_fb_h_ : (fb ? uint32_t(fb.height) : 0u);
+        uv[0] = uv_scale_[0];
+        uv[1] = uv_scale_[1];
+      }
 
-    id<MTLTexture> fb = nil;
-    id<MTLTexture> lut = nil;
-    uint32_t fb_w = 0, fb_h = 0;
-    float uv[2] = {1.0f, 1.0f};
-    {
-      std::lock_guard<std::mutex> lock(fb_mutex_);
-      fb = guest_fb_ ? guest_fb_ : (g_guest_frame_tex ? g_guest_frame_tex : g_guest_frontbuffer_mtl);
-      lut = gamma_lut_ ? gamma_lut_ : default_gamma_;
-      fb_w = guest_fb_w_ ? guest_fb_w_ : (fb ? uint32_t(fb.width) : 0u);
-      fb_h = guest_fb_h_ ? guest_fb_h_ : (fb ? uint32_t(fb.height) : 0u);
-      uv[0] = uv_scale_[0];
-      uv[1] = uv_scale_[1];
+      const bool has_fb = (fb && fb_w > 0 && fb_h > 0 && present_pso_);
+      double scale = 1.0, w = 0.0, h = 0.0, vx = 0.0, vy = 0.0;
+      bool full_cover = false;
+      if (has_fb) {
+        scale = std::min(double(dw) / fb_w, double(dh) / fb_h);
+        w = fb_w * scale;
+        h = fb_h * scale;
+        vx = (dw - w) * 0.5;
+        vy = (dh - h) * 0.5;
+        full_cover = (vx <= 0.5 && vy <= 0.5 && w + 1.0 >= double(dw) && h + 1.0 >= double(dh));
+      }
+
+      MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+      pass.colorAttachments[0].texture = drawable.texture;
+      pass.colorAttachments[0].loadAction = full_cover ? MTLLoadActionDontCare : MTLLoadActionClear;
+      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+
+      id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+
+      if (has_fb) {
+        [enc setViewport:{vx, vy, w, h, 0.0, 1.0}];
+        [enc setScissorRect:{0, 0, dw, dh}];
+        [enc setRenderPipelineState:present_pso_];
+        [enc setFragmentBytes:uv length:sizeof(uv) atIndex:0];
+        [enc setFragmentTexture:fb atIndex:0];
+        [enc setFragmentTexture:lut atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      }
+
+      if (execute_ui_drawers) {
+        [enc setViewport:{0.0, 0.0, double(dw), double(dh), 0.0, 1.0}];
+        [enc setScissorRect:{0, 0, dw, dh}];
+        MetalUIDrawContext ui_ctx(*this, dw, dh, enc);
+        ExecuteUIDrawersFromUIThread(ui_ctx);
+      }
+
+      [enc endEncoding];
+      [cmd presentDrawable:drawable];
+      const uint64_t cmd_id = PrepareTrackedMetalCmd(cmd);
+      [cmd commit];
+      MarkCommittedMetalCmd(cmd, cmd_id);
+      RecordHostPresent();
+      if (fb) {
+        RecordRenderedFrame();
+      }
+      return PaintResult::kPresented;
     }
-
-    if (fb && fb_w > 0 && fb_h > 0 && present_pso_) {
-      double scale = std::min(double(dw) / fb_w, double(dh) / fb_h);
-      double w = fb_w * scale, h = fb_h * scale;
-      [enc setViewport:{(dw - w) * 0.5, (dh - h) * 0.5, w, h, 0.0, 1.0}];
-      [enc setScissorRect:{0, 0, dw, dh}];
-      [enc setRenderPipelineState:present_pso_];
-      [enc setFragmentBytes:uv length:sizeof(uv) atIndex:0];
-      [enc setFragmentTexture:fb atIndex:0];
-      [enc setFragmentTexture:lut atIndex:1];
-      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    }
-
-    if (execute_ui_drawers) {
-      [enc setViewport:{0.0, 0.0, double(dw), double(dh), 0.0, 1.0}];
-      [enc setScissorRect:{0, 0, dw, dh}];
-      MetalUIDrawContext ui_ctx(*this, dw, dh, enc);
-      ExecuteUIDrawersFromUIThread(ui_ctx);
-    }
-
-    [enc endEncoding];
-    [cmd presentDrawable:drawable];
-    const uint64_t cmd_id = PrepareTrackedMetalCmd(cmd);
-    [cmd commit];
-    MarkCommittedMetalCmd(cmd, cmd_id);
-    RecordHostPresent();
-    if (fb) {
-      RecordRenderedFrame();
-    }
-    return PaintResult::kPresented;
   }
 
   static CAMetalLayer* current_ios_metal_layer();
@@ -842,7 +887,13 @@ class MetalCommandProcessor final : public CommandProcessor {
     ring_slot_ = 0;
     swap_index_ = 0;
     ring_offset_ = 0;
+    const bool use_075 = rex_ios_is_low_power_075x_active();
+    scale_num_ = use_075 ? 3u : 1u;
+    scale_den_ = use_075 ? 4u : 1u;
+    last_resolved_guest_w_ = last_resolved_guest_h_ = 0;
+    pass_guest_w_ = pass_guest_h_ = 0;
     ResetConstCache();
+    ResetEncoderState();
 
     if (memory_ && register_file_) {
       ui_sniffer_ = std::make_unique<UiQuadSniffer>(*register_file_, *memory_);
@@ -866,6 +917,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     textures_.clear();
     resolved_.clear();
     targets_.clear();
+    drawn_extents_.clear();
+    pending_depth_clears_.clear();
+    pending_color_clears_.clear();
     pipelines_.clear();
     depth_states_.clear();
     shaders_.clear();
@@ -948,6 +1002,7 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool) override {
+    @autoreleasepool {
     auto& regs = *register_file_;
     auto mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
     if (mode == xenos::EdramMode::kCopy) {
@@ -998,39 +1053,51 @@ class MetalCommandProcessor final : public CommandProcessor {
     const uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
     id<MTLTexture> colors[4] = {};
     uint32_t blend[4] = {};
-    id<MTLTexture> size_ref = nil;
+    TargetEntry size_ref{};
     for (uint32_t i = 0; i < 4; ++i) {
       if (depth_only || !(ps->info.colorTargets & (1u << i)) || !((color_mask >> (i * 4)) & 0xF)) {
         continue;
       }
       auto info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-      colors[i] = GetTarget(info.color_base, pitch, uint32_t(info.color_format), false);
+      TargetEntry te = GetTargetEntry(info.color_base, pitch, uint32_t(info.color_format), false);
+      colors[i] = te.texture;
       blend[i] = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
-      if (!size_ref) size_ref = colors[i];
+      if (!size_ref.texture) size_ref = te;
     }
 
     reg::RB_DEPTHCONTROL depth_ctrl = draw_util::GetNormalizedDepthControl(regs);
     id<MTLTexture> depth = nil;
     if (depth_ctrl.z_enable || depth_ctrl.stencil_enable) {
       auto info = regs.Get<reg::RB_DEPTH_INFO>();
-      depth = GetTarget(info.depth_base, pitch, uint32_t(info.depth_format), true);
-      if (!size_ref) size_ref = depth;
+      TargetEntry te = GetTargetEntry(info.depth_base, pitch, uint32_t(info.depth_format), true);
+      depth = te.texture;
+      if (!size_ref.texture) size_ref = te;
     }
-    if (!size_ref) return true;
+    if (!size_ref.texture) return true;
 
-    const uint32_t width = uint32_t(size_ref.width);
-    const uint32_t height = uint32_t(size_ref.height);
+    const uint32_t host_w = uint32_t(size_ref.texture.width);
+    const uint32_t host_h = uint32_t(size_ref.texture.height);
+    const uint32_t guest_w = size_ref.guest_w;
+    const uint32_t guest_h = size_ref.guest_h;
 
     draw_util::Scissor scissor{};
     draw_util::GetScissor(regs, scissor);
-    uint32_t sx = std::min(scissor.offset[0], width);
-    uint32_t sy = std::min(scissor.offset[1], height);
-    uint32_t sw = std::min(scissor.extent[0], width - sx);
-    uint32_t sh = std::min(scissor.extent[1], height - sy);
+    const uint32_t gsx = std::min(scissor.offset[0], guest_w);
+    const uint32_t gsy = std::min(scissor.offset[1], guest_h);
+    const uint32_t gsw = std::min(scissor.extent[0], guest_w - gsx);
+    const uint32_t gsh = std::min(scissor.extent[1], guest_h - gsy);
+    if (!gsw || !gsh) return true;
+
+    const uint32_t sx = std::min((gsx * scale_num_) / scale_den_, host_w);
+    const uint32_t sy = std::min((gsy * scale_num_) / scale_den_, host_h);
+    const uint32_t sx1 = std::min(host_w, ((gsx + gsw) * scale_num_ + scale_den_ - 1u) / scale_den_);
+    const uint32_t sy1 = std::min(host_h, ((gsy + gsh) * scale_num_ + scale_den_ - 1u) / scale_den_);
+    const uint32_t sw = (sx1 > sx) ? (sx1 - sx) : 0u;
+    const uint32_t sh = (sy1 > sy) ? (sy1 - sy) : 0u;
     if (!sw || !sh) return true;
 
     draw_util::ViewportInfo vp{};
-    draw_util::GetHostViewportInfo(regs, 1, 1, true, width, height, false, depth_ctrl, false, false,
+    draw_util::GetHostViewportInfo(regs, 1, 1, true, guest_w, guest_h, false, depth_ctrl, false, false,
                                    ps->info.writesDepth, vp);
 
     id<MTLTexture> textures[32]{};
@@ -1044,7 +1111,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       auto fetch = regs.GetTextureFetch(t);
       id<MTLTexture> tex = GetTexture(fetch);
       const float scale = tex ? float(tex.width) / float(fetch.size_2d.width + 1) : 1.0f;
-      tex_scales[t] = scale >= 1.5f ? std::round(scale) : 1.0f;
+      tex_scales[t] = (scale >= 1.5f) ? std::round(scale)
+                                      : ((std::abs(scale - 1.0f) < 0.01f) ? 1.0f : scale);
       textures[tex_count] = tex ? tex : dummy_tex_;
       samplers[tex_count] = GetSampler(fetch);
       tex_count++;
@@ -1072,27 +1140,69 @@ class MetalCommandProcessor final : public CommandProcessor {
         GetPipeline(vs, ps, colors, depth, blend, color_mask, alpha_func);
     if (!pipeline) return false;
 
-    id<MTLRenderCommandEncoder> enc = BeginPass(colors, depth, sx + sw, sy + sh);
-    [enc setRenderPipelineState:pipeline];
-    [enc setViewport:{double(vp.xy_offset[0]), double(vp.xy_offset[1]), double(vp.xy_extent[0]),
-                      double(vp.xy_extent[1]), double(vp.z_min), double(vp.z_max)}];
-    [enc setScissorRect:{sx, sy, sw, sh}];
-    [enc setCullMode:!polygonal ? MTLCullModeNone
-                                : sc.cull_front ? MTLCullModeFront
-                                                : sc.cull_back ? MTLCullModeBack : MTLCullModeNone];
-    [enc setFrontFacingWinding:sc.face ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    id<MTLRenderCommandEncoder> enc = BeginPass(colors, depth, sx + sw, sy + sh, guest_w, guest_h);
+    if (enc_pipeline_ != pipeline) {
+      [enc setRenderPipelineState:pipeline];
+      enc_pipeline_ = pipeline;
+    }
+    const double res_scale = double(scale_num_) / double(scale_den_);
+    const MTLViewport mtl_vp{double(vp.xy_offset[0]) * res_scale,
+                             double(vp.xy_offset[1]) * res_scale,
+                             double(vp.xy_extent[0]) * res_scale,
+                             double(vp.xy_extent[1]) * res_scale,
+                             double(vp.z_min),
+                             double(vp.z_max)};
+    if (!enc_has_vp_ || mtl_vp.originX != enc_vp_.originX || mtl_vp.originY != enc_vp_.originY ||
+        mtl_vp.width != enc_vp_.width || mtl_vp.height != enc_vp_.height ||
+        mtl_vp.znear != enc_vp_.znear || mtl_vp.zfar != enc_vp_.zfar) {
+      [enc setViewport:mtl_vp];
+      enc_vp_ = mtl_vp;
+      enc_has_vp_ = true;
+    }
+    if (!enc_has_sc_ || sx != enc_sc_.x || sy != enc_sc_.y || sw != enc_sc_.width ||
+        sh != enc_sc_.height) {
+      enc_sc_ = {sx, sy, sw, sh};
+      [enc setScissorRect:enc_sc_];
+      enc_has_sc_ = true;
+    }
+    const MTLCullMode cull = !polygonal ? MTLCullModeNone
+                                        : sc.cull_front ? MTLCullModeFront
+                                                        : sc.cull_back ? MTLCullModeBack
+                                                                       : MTLCullModeNone;
+    if (enc_cull_ != cull) {
+      [enc setCullMode:cull];
+      enc_cull_ = cull;
+    }
+    const MTLWinding winding = sc.face ? MTLWindingClockwise : MTLWindingCounterClockwise;
+    if (enc_winding_ != winding) {
+      [enc setFrontFacingWinding:winding];
+      enc_winding_ = winding;
+    }
     if (depth) {
       const uint32_t rm = regs[XE_GPU_REG_RB_STENCILREFMASK];
       const uint32_t rmb = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
-      [enc setDepthStencilState:GetDepthState(depth_ctrl, rm, rmb)];
-      [enc setStencilFrontReferenceValue:rm & 0xFF
-                      backReferenceValue:(depth_ctrl.backface_enable ? rmb : rm) & 0xFF];
+      id<MTLDepthStencilState> ds = GetDepthState(depth_ctrl, rm, rmb);
+      if (enc_depth_state_ != ds) {
+        [enc setDepthStencilState:ds];
+        enc_depth_state_ = ds;
+      }
+      const uint32_t sf = rm & 0xFFu;
+      const uint32_t sb = (depth_ctrl.backface_enable ? rmb : rm) & 0xFFu;
+      if (enc_stencil_f_ != sf || enc_stencil_b_ != sb) {
+        [enc setStencilFrontReferenceValue:sf backReferenceValue:sb];
+        enc_stencil_f_ = sf;
+        enc_stencil_b_ = sb;
+      }
     }
     auto rf = [&](uint32_t idx) { return rex::memory::Reinterpret<float>(regs[idx]); };
-    [enc setBlendColorRed:rf(XE_GPU_REG_RB_BLEND_RED)
-                    green:rf(XE_GPU_REG_RB_BLEND_GREEN)
-                     blue:rf(XE_GPU_REG_RB_BLEND_BLUE)
-                    alpha:rf(XE_GPU_REG_RB_BLEND_ALPHA)];
+    const float bc[4] = {rf(XE_GPU_REG_RB_BLEND_RED), rf(XE_GPU_REG_RB_BLEND_GREEN),
+                         rf(XE_GPU_REG_RB_BLEND_BLUE), rf(XE_GPU_REG_RB_BLEND_ALPHA)};
+    if (!enc_has_blend_ || bc[0] != enc_blend_[0] || bc[1] != enc_blend_[1] ||
+        bc[2] != enc_blend_[2] || bc[3] != enc_blend_[3]) {
+      [enc setBlendColorRed:bc[0] green:bc[1] blue:bc[2] alpha:bc[3]];
+      std::memcpy(enc_blend_, bc, sizeof(bc));
+      enc_has_blend_ = true;
+    }
 
     auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
     XeDraw d{};
@@ -1110,7 +1220,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     d.primitive = uint32_t(prim_type);
     d.alphaFunc = alpha_func;
     d.alphaRef = rf(XE_GPU_REG_RB_ALPHA_REF);
-    d.pixelScale = 1.0f;
+    d.pixelScale = float(res_scale);
     d.memSplitWord = (gpu_mem_split_byte_ == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (gpu_mem_split_byte_ >> 2);
     d.pad = 0;
 
@@ -1168,15 +1278,23 @@ class MetalCommandProcessor final : public CommandProcessor {
     }
     [enc setFragmentBytes:tex_scales length:sizeof(tex_scales) atIndex:3];
     for (uint32_t i = 0; i < tex_count; ++i) {
-      [enc setFragmentTexture:textures[i] atIndex:i];
-      [enc setFragmentSamplerState:samplers[i] atIndex:i];
+      if (enc_tex_[i] != textures[i]) {
+        [enc setFragmentTexture:textures[i] atIndex:i];
+        enc_tex_[i] = textures[i];
+      }
+      if (enc_samp_[i] != samplers[i]) {
+        [enc setFragmentSamplerState:samplers[i] atIndex:i];
+        enc_samp_[i] = samplers[i];
+      }
     }
     ++frame_draws_;
     [enc drawPrimitives:mtl_prim vertexStart:0 vertexCount:count];
     return true;
+    }
   }
 
   bool IssueCopy() override {
+    @autoreleasepool {
     const auto& regs = *register_file_;
     auto copy = regs.Get<reg::RB_COPY_CONTROL>();
     if (copy.copy_command != xenos::CopyCommand::kRaw &&
@@ -1192,9 +1310,10 @@ class MetalCommandProcessor final : public CommandProcessor {
 
     if (uint32_t(copy.copy_src_select) < 4) {
       auto info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[uint32_t(copy.copy_src_select)]);
-      id<MTLTexture> target = GetTarget(info.color_base, pitch, uint32_t(info.color_format), false);
-      x1 = std::min(x1, int32_t(target.width));
-      y1 = std::min(y1, int32_t(target.height));
+      TargetEntry target_entry = GetTargetEntry(info.color_base, pitch, uint32_t(info.color_format), false);
+      id<MTLTexture> target = target_entry.texture;
+      x1 = std::min(x1, int32_t(target_entry.guest_w));
+      y1 = std::min(y1, int32_t(target_entry.guest_h));
       if (x0 >= x1 || y0 >= y1) return true;
 
       const bool readable_rt = (target.pixelFormat == MTLPixelFormatRGBA8Unorm ||
@@ -1215,8 +1334,10 @@ class MetalCommandProcessor final : public CommandProcessor {
                            uint32_t(dest.copy_dest_endian),
                            uint32_t(dest.copy_dest_swap),
                            regs[XE_GPU_REG_RB_COLOR_CLEAR],
-                           1u,
-                           gpu_mem_split_byte_};
+                           scale_num_,
+                           scale_den_,
+                           gpu_mem_split_byte_,
+                           0u};
 
       const bool copy_rgba8 =
           (dest.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 ||
@@ -1226,10 +1347,13 @@ class MetalCommandProcessor final : public CommandProcessor {
            dest.copy_dest_format == xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16);
       if (dest_base && readable_rt && copy_rgba8 &&
           dest_pitch.copy_dest_pitch && dest_pitch.copy_dest_height) {
+        FlushColorClear(target);
         id<MTLTexture> copy_tex =
             GetResolveTexture(dest_base, dest_pitch.copy_dest_pitch, dest_pitch.copy_dest_height);
         DispatchCompute(resolve_pso_, params, target, copy_tex);
         last_resolved_tex_ = copy_tex;
+        last_resolved_guest_w_ = dest_pitch.copy_dest_pitch;
+        last_resolved_guest_h_ = dest_pitch.copy_dest_height;
         // Only evict cached CPU textures overlapping the resolved physical EDRAM destination.
         const uint32_t r_start = dest_base & 0x1FFFFFFFu;
         const uint64_t r_bytes = uint64_t(rex::align(uint32_t(dest_pitch.copy_dest_pitch), 32u)) *
@@ -1243,20 +1367,12 @@ class MetalCommandProcessor final : public CommandProcessor {
       }
       if (copy.color_clear_enable) {
         if (target.pixelFormat == MTLPixelFormatRGBA8Unorm && x0 == 0 && y0 == 0 &&
-            uint32_t(x1) == uint32_t(target.width) && uint32_t(y1) == uint32_t(target.height)) {
+            uint32_t(x1) == target_entry.guest_w && uint32_t(y1) == target_entry.guest_h) {
           EndPass();
-          MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-          pass.renderTargetWidth = uint32_t(x1);
-          pass.renderTargetHeight = uint32_t(y1);
-          pass.colorAttachments[0].texture = target;
-          pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-          pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-          const uint32_t c = params.clearValue;
-          pass.colorAttachments[0].clearColor = MTLClearColorMake(
-              (c & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
-              ((c >> 16) & 0xFF) / 255.0, (c >> 24) / 255.0);
-          [[Commands() renderCommandEncoderWithDescriptor:pass] endEncoding];
+          pending_color_clears_[(__bridge void*)target] = {
+              params.clearValue, uint32_t(target.width), uint32_t(target.height)};
         } else if (rgba8) {
+          FlushColorClear(target);
           DispatchCompute(clear_pso_, params, nil, target);
         }
       }
@@ -1264,11 +1380,17 @@ class MetalCommandProcessor final : public CommandProcessor {
 
     if (copy.depth_clear_enable) {
       auto info = regs.Get<reg::RB_DEPTH_INFO>();
-      id<MTLTexture> depth = GetTarget(info.depth_base, pitch, uint32_t(info.depth_format), true);
+      TargetEntry depth_entry = GetTargetEntry(info.depth_base, pitch, uint32_t(info.depth_format), true);
+      id<MTLTexture> depth = depth_entry.texture;
+      const uint32_t clear_right =
+          std::min(uint32_t(depth.width), (uint32_t(x1) * scale_num_ + scale_den_ - 1u) / scale_den_);
+      const uint32_t clear_bottom =
+          std::min(uint32_t(depth.height), (uint32_t(y1) * scale_num_ + scale_den_ - 1u) / scale_den_);
       pending_depth_clears_[(__bridge void*)depth] = {regs[XE_GPU_REG_RB_DEPTH_CLEAR],
-                                                       uint32_t(x1), uint32_t(y1)};
+                                                       clear_right, clear_bottom};
     }
     return true;
+    }
   }
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t fb_width, uint32_t fb_height) override {
@@ -1286,6 +1408,9 @@ class MetalCommandProcessor final : public CommandProcessor {
       float uv_y = (fetch.size_2d.height > 0)
                        ? (float(fb_height) / float(fetch.size_2d.height + 1))
                        : 1.0f;
+      if (!pending_color_clears_.empty()) {
+        FlushAllColorClears();
+      }
       if (!fb && frontbuffer_ptr) {
         auto it = resolved_.find(frontbuffer_ptr & 0x1FFFFFFFu);
         if (it != resolved_.end() && it->second.texture) {
@@ -1296,13 +1421,17 @@ class MetalCommandProcessor final : public CommandProcessor {
       }
       if (!fb && last_resolved_tex_) {
         fb = last_resolved_tex_;
-        uv_x = float(fb_width) / float(std::max<uint32_t>(1u, uint32_t(fb.width)));
-        uv_y = float(fb_height) / float(std::max<uint32_t>(1u, uint32_t(fb.height)));
+        const uint32_t rw = last_resolved_guest_w_ ? last_resolved_guest_w_ : uint32_t(fb.width);
+        const uint32_t rh = last_resolved_guest_h_ ? last_resolved_guest_h_ : uint32_t(fb.height);
+        uv_x = float(fb_width) / float(std::max(1u, rw));
+        uv_y = float(fb_height) / float(std::max(1u, rh));
       }
       if (!fb && pass_colors_[0]) {
         fb = pass_colors_[0];
-        uv_x = float(fb_width) / float(std::max<uint32_t>(1u, uint32_t(fb.width)));
-        uv_y = float(fb_height) / float(std::max<uint32_t>(1u, uint32_t(fb.height)));
+        const uint32_t pw = pass_guest_w_ ? pass_guest_w_ : uint32_t(fb.width);
+        const uint32_t ph = pass_guest_h_ ? pass_guest_h_ : uint32_t(fb.height);
+        uv_x = float(fb_width) / float(std::max(1u, pw));
+        uv_y = float(fb_height) / float(std::max(1u, ph));
       }
       EndPass();
 
@@ -1430,6 +1559,9 @@ class MetalCommandProcessor final : public CommandProcessor {
       }
 
       generation_++;
+      const bool next_075 = rex_ios_is_low_power_075x_active();
+      scale_num_ = next_075 ? 3u : 1u;
+      scale_den_ = next_075 ? 4u : 1u;
       if (generation_ % 60 == 0) {
         std::erase_if(textures_, [this](const auto& kv) {
           return generation_ - kv.second.checked_gen > 600;
@@ -1462,9 +1594,14 @@ class MetalCommandProcessor final : public CommandProcessor {
     int active_slot = 0;
     bool is_dynamic = false;
   };
+  struct TargetEntry {
+    id<MTLTexture> texture = nil;
+    uint32_t guest_w = 0, guest_h = 0;
+  };
   struct ResolvedTarget {
     id<MTLTexture> texture = nil;
     uint32_t width = 0, height = 0, bytes = 0;
+    uint32_t scale_num = 1, scale_den = 1;
     uint64_t resolved_gen = 0;
     uint64_t resolves = 0;
     uint64_t pending_seq = 0;
@@ -1479,10 +1616,65 @@ class MetalCommandProcessor final : public CommandProcessor {
   struct DepthClear {
     uint32_t value = 0, right = 0, bottom = 0;
   };
+  struct ColorClear {
+    uint32_t value = 0, right = 0, bottom = 0;
+  };
 
   id<MTLCommandBuffer> Commands() {
     if (!commands_) commands_ = [queue_ commandBuffer];
     return commands_;
+  }
+  void ResetEncoderState() {
+    enc_pipeline_ = nil;
+    enc_depth_state_ = nil;
+    enc_stencil_f_ = UINT32_MAX;
+    enc_stencil_b_ = UINT32_MAX;
+    enc_cull_ = MTLCullMode(99);
+    enc_winding_ = MTLWinding(99);
+    enc_has_vp_ = false;
+    enc_has_sc_ = false;
+    enc_has_blend_ = false;
+    std::fill(std::begin(enc_tex_), std::end(enc_tex_), nil);
+    std::fill(std::begin(enc_samp_), std::end(enc_samp_), nil);
+  }
+  void FlushColorClear(id<MTLTexture> target) {
+    if (!target) return;
+    auto it = pending_color_clears_.find((__bridge void*)target);
+    if (it == pending_color_clears_.end()) return;
+    const ColorClear cc = it->second;
+    pending_color_clears_.erase(it);
+    EndPass();
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.renderTargetWidth = cc.right;
+    pass.renderTargetHeight = cc.bottom;
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    const uint32_t c = cc.value;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(
+        (c & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
+        ((c >> 16) & 0xFF) / 255.0, (c >> 24) / 255.0);
+    [[Commands() renderCommandEncoderWithDescriptor:pass] endEncoding];
+  }
+  void FlushAllColorClears() {
+    if (pending_color_clears_.empty()) return;
+    EndPass();
+    for (const auto& [ptr, cc] : pending_color_clears_) {
+      id<MTLTexture> target = (__bridge id<MTLTexture>)ptr;
+      if (!target) continue;
+      MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+      pass.renderTargetWidth = cc.right;
+      pass.renderTargetHeight = cc.bottom;
+      pass.colorAttachments[0].texture = target;
+      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      const uint32_t c = cc.value;
+      pass.colorAttachments[0].clearColor = MTLClearColorMake(
+          (c & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
+          ((c >> 16) & 0xFF) / 255.0, (c >> 24) / 255.0);
+      [[Commands() renderCommandEncoderWithDescriptor:pass] endEncoding];
+    }
+    pending_color_clears_.clear();
   }
   void EndPass() {
     if (encoder_) {
@@ -1491,6 +1683,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     }
     enc_vs_buf_ = enc_ps_buf_ = enc_bool_buf_ = enc_fetch_buf_ = nil;
     enc_vs_off_ = enc_ps_off_ = enc_bool_off_ = enc_fetch_off_ = UINT32_MAX;
+    ResetEncoderState();
   }
   void Submit(bool wait) {
     EndPass();
@@ -1562,32 +1755,40 @@ class MetalCommandProcessor final : public CommandProcessor {
     }
   }
 
-  id<MTLTexture> GetTarget(uint32_t base_tiles, uint32_t pitch, uint32_t format, bool depth) {
+  TargetEntry GetTargetEntry(uint32_t base_tiles, uint32_t pitch, uint32_t format, bool depth) {
     const uint64_t key = uint64_t(base_tiles) | (uint64_t(pitch) << 12) |
-                         (uint64_t(format) << 26) | (uint64_t(depth) << 40);
-    __strong id<MTLTexture>& tex = targets_[key];
-    if (!tex) {
+                         (uint64_t(format) << 26) | (uint64_t(depth) << 40) |
+                         (uint64_t((scale_num_ == 3u && scale_den_ == 4u) ? 1u : 0u) << 41);
+    TargetEntry& entry = targets_[key];
+    if (!entry.texture) {
       uint32_t tpr = std::max(1u, (pitch + xenos::kEdramTileWidthSamples - 1) / xenos::kEdramTileWidthSamples);
       uint32_t rows = (xenos::kEdramTileCount - std::min(base_tiles, xenos::kEdramTileCount - 1)) / tpr;
-      uint32_t h = std::clamp(rows * xenos::kEdramTileHeightSamples, 1u, 2048u);
-      uint32_t w = std::max(pitch, 1u);
+      uint32_t gh = std::clamp(rows * xenos::kEdramTileHeightSamples, 1u, 2048u);
+      uint32_t gw = std::max(pitch, 1u);
+      uint32_t w = std::max(1u, (gw * scale_num_) / scale_den_);
+      uint32_t h = std::max(1u, (gh * scale_num_) / scale_den_);
       MTLPixelFormat pf = depth ? MTLPixelFormatDepth32Float_Stencil8
                                 : ColorFormat(static_cast<xenos::ColorRenderTargetFormat>(format));
       MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
       d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | (depth ? 0 : MTLTextureUsageShaderWrite);
       d.storageMode = MTLStorageModePrivate;
-      tex = [device_ newTextureWithDescriptor:d];
+      entry.texture = [device_ newTextureWithDescriptor:d];
+      entry.guest_w = gw;
+      entry.guest_h = gh;
     }
-    return tex;
+    return entry;
   }
 
   id<MTLTexture> GetResolveTexture(uint32_t base, uint32_t width, uint32_t height) {
     ResolvedTarget& r = resolved_[base];
-    if (!r.texture || r.width != width || r.height != height) {
+    const uint32_t host_w = std::max(1u, (width * scale_num_) / scale_den_);
+    const uint32_t host_h = std::max(1u, (height * scale_num_) / scale_den_);
+    if (!r.texture || r.width != width || r.height != height || r.scale_num != scale_num_ ||
+        r.scale_den != scale_den_) {
       MTLTextureDescriptor* d =
           [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                             width:width
-                                                            height:height
+                                                             width:host_w
+                                                            height:host_h
                                                          mipmapped:NO];
       d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
       d.storageMode = MTLStorageModeShared;
@@ -1596,6 +1797,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       r.windows.clear();
       r.width = width;
       r.height = height;
+      r.scale_num = scale_num_;
+      r.scale_den = scale_den_;
       r.bytes = rex::align(width, 32u) * rex::align(height, 32u) * 4;
     }
     r.resolved_gen = generation_;
@@ -1687,25 +1890,31 @@ class MetalCommandProcessor final : public CommandProcessor {
       id<MTLTexture> src = r.texture;
       auto* views = &r.views;
       if (w != r.width || h != r.height) {
+        const uint32_t win_w = std::max(1u, (w * r.scale_num) / r.scale_den);
+        const uint32_t win_h = std::max(1u, (h * r.scale_num) / r.scale_den);
         ResolvedTarget::Window& win = r.windows[w | (h << 16)];
-        if (!win.texture) {
+        if (!win.texture || win.texture.width != win_w || win.texture.height != win_h) {
           MTLTextureDescriptor* td =
               [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                 width:w
-                                                                height:h
+                                                                 width:win_w
+                                                                height:win_h
                                                              mipmapped:NO];
           td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
           td.storageMode = MTLStorageModePrivate;
           win.texture = [device_ newTextureWithDescriptor:td];
+          win.views.clear();
+          win.copied = ~0ull;
         }
         if (win.copied != r.resolves) {
+          const uint32_t cw = std::min(win_w, uint32_t(r.texture.width));
+          const uint32_t ch = std::min(win_h, uint32_t(r.texture.height));
           EndPass();
           id<MTLBlitCommandEncoder> blit = [Commands() blitCommandEncoder];
           [blit copyFromTexture:r.texture
                     sourceSlice:0
                     sourceLevel:0
                    sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake(w, h, 1)
+                     sourceSize:MTLSizeMake(cw, ch, 1)
                       toTexture:win.texture
                destinationSlice:0
                destinationLevel:0
@@ -1749,7 +1958,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     if (!base_page) return nil;
     const uint32_t width = w1 + 1, height = h1 + 1;
     const bool is_video_plane =
-        (fetch.format == xenos::TextureFormat::k_8) && (width >= 320u && height >= 180u);
+        (fetch.format == xenos::TextureFormat::k_8) && (width >= 160u && height >= 90u);
 
     const auto* info = FormatInfo::Get(uint32_t(fetch.format));
     if (!info) return nil;
@@ -1781,7 +1990,16 @@ class MetalCommandProcessor final : public CommandProcessor {
       return active_tex;
     }
 
-    const uint64_t new_hash = XXH3_64bits(base, extent);
+    // Snapshot dynamic/video textures before hashing so background Bink decoding cannot tear
+    // between XXH3 hashing and per-row copy into Metal staging memory.
+    const uint8_t* src_bytes = base;
+    if (full_hash_every_frame) {
+      tex_raw_staging_.resize(extent);
+      std::memcpy(tex_raw_staging_.data(), base, extent);
+      src_bytes = tex_raw_staging_.data();
+    }
+
+    const uint64_t new_hash = XXH3_64bits(src_bytes, extent);
     entry.checked_gen = generation_;
     entry.phys_start = phys_off;
     entry.phys_end = phys_off + extent;
@@ -1800,29 +2018,66 @@ class MetalCommandProcessor final : public CommandProcessor {
     entry.data_hash = new_hash;
 
     uint32_t row_bytes = blocks_x * bpb;
-    tex_upload_blocks_.resize(size_t(row_bytes) * blocks_y);
+    uint32_t upload_row_bytes = !fetch.tiled ? rex::align(row_bytes, 256u) : row_bytes;
+    tex_upload_blocks_.resize(size_t(upload_row_bytes) * blocks_y);
+    std::memset(tex_upload_blocks_.data(), 0, tex_upload_blocks_.size());
     const uint32_t pitch_blocks = layout.base.row_pitch_bytes >> bpb_log2;
-    for (uint32_t y = 0; y < blocks_y; ++y) {
-      for (uint32_t x = 0; x < blocks_x; ++x) {
-        const uint32_t sx = x + ox, sy = y + oy;
-        const uint32_t off =
-            fetch.tiled ? uint32_t(texture_util::GetTiledOffset2D(int32_t(sx), int32_t(sy),
-                                                                  pitch_blocks, bpb_log2))
-                        : sy * layout.base.row_pitch_bytes + (sx << bpb_log2);
-        if (off + bpb > extent) continue;
-        uint8_t* out = &tex_upload_blocks_[size_t(y) * row_bytes + size_t(x) * bpb];
-        if (bpb >= 4) {
-          for (uint32_t i = 0; i < bpb; i += 4) {
+    if (!fetch.tiled && bpb == 1u) {
+      const uint32_t endian_u = uint32_t(fetch.endianness);
+      for (uint32_t y = 0; y < blocks_y; ++y) {
+        const uint32_t sy = y + oy;
+        const uint32_t row_off = sy * layout.base.row_pitch_bytes + ox;
+        if (row_off >= extent) continue;
+        const uint32_t avail = std::min(blocks_x, extent - row_off);
+        uint8_t* dst_row = &tex_upload_blocks_[size_t(y) * upload_row_bytes];
+        if (endian_u == uint32_t(xenos::Endian::kNone)) {
+          std::memcpy(dst_row, src_bytes + row_off, avail);
+        } else if ((row_off & 3u) == 0u) {
+          uint32_t x = 0;
+          for (; x + 4u <= avail; x += 4u) {
             uint32_t w;
-            std::memcpy(&w, base + off + i, 4);
+            std::memcpy(&w, src_bytes + row_off + x, 4);
             w = SwapWord(w, fetch.endianness);
-            std::memcpy(out + i, &w, 4);
+            std::memcpy(dst_row + x, &w, 4);
+          }
+          for (; x < avail; ++x) {
+            const uint32_t off = row_off + x;
+            uint32_t w;
+            std::memcpy(&w, src_bytes + (off & ~3u), 4);
+            dst_row[x] = uint8_t(SwapWord(w, fetch.endianness) >> ((off & 3u) * 8u));
           }
         } else {
-          uint32_t w;
-          std::memcpy(&w, base + (off & ~3u), 4);
-          w = SwapWord(w, fetch.endianness) >> ((off & 3u) * 8u);
-          std::memcpy(out, &w, bpb);
+          for (uint32_t x = 0; x < avail; ++x) {
+            const uint32_t off = row_off + x;
+            uint32_t w;
+            std::memcpy(&w, src_bytes + (off & ~3u), 4);
+            dst_row[x] = uint8_t(SwapWord(w, fetch.endianness) >> ((off & 3u) * 8u));
+          }
+        }
+      }
+    } else {
+      for (uint32_t y = 0; y < blocks_y; ++y) {
+        for (uint32_t x = 0; x < blocks_x; ++x) {
+          const uint32_t sx = x + ox, sy = y + oy;
+          const uint32_t off =
+              fetch.tiled ? uint32_t(texture_util::GetTiledOffset2D(int32_t(sx), int32_t(sy),
+                                                                    pitch_blocks, bpb_log2))
+                          : sy * layout.base.row_pitch_bytes + (sx << bpb_log2);
+          if (off + bpb > extent) continue;
+          uint8_t* out = &tex_upload_blocks_[size_t(y) * upload_row_bytes + size_t(x) * bpb];
+          if (bpb >= 4) {
+            for (uint32_t i = 0; i < bpb; i += 4) {
+              uint32_t w;
+              std::memcpy(&w, src_bytes + off + i, 4);
+              w = SwapWord(w, fetch.endianness);
+              std::memcpy(out + i, &w, 4);
+            }
+          } else {
+            uint32_t w;
+            std::memcpy(&w, src_bytes + (off & ~3u), 4);
+            w = SwapWord(w, fetch.endianness) >> ((off & 3u) * 8u);
+            std::memcpy(out, &w, bpb);
+          }
         }
       }
     }
@@ -1892,22 +2147,26 @@ class MetalCommandProcessor final : public CommandProcessor {
     const uint8_t* upload_ptr = tex_upload_blocks_.data();
     if (expand16 != 0) {
       tex_upload_rgba_.resize(size_t(width) * height * 4);
-      for (size_t i = 0; i < size_t(width) * height; ++i) {
-        uint16_t v = 0;
-        std::memcpy(&v, &tex_upload_blocks_[i * 2], 2);
-        uint8_t* o = &tex_upload_rgba_[i * 4];
-        if (expand16 == 1) {
-          o[0] = ExpandBits(v & 31, 5); o[1] = ExpandBits((v >> 5) & 63, 6);
-          o[2] = ExpandBits(v >> 11, 5); o[3] = 255;
-        } else if (expand16 == 2) {
-          o[0] = ExpandBits(v & 31, 5); o[1] = ExpandBits((v >> 5) & 31, 5);
-          o[2] = ExpandBits((v >> 10) & 31, 5); o[3] = (v >> 15) ? 255 : 0;
-        } else {
-          for (int k = 0; k < 4; ++k) o[k] = ExpandBits((v >> (k * 4)) & 15, 4);
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* src_row = &tex_upload_blocks_[size_t(y) * upload_row_bytes];
+        uint8_t* dst_row = &tex_upload_rgba_[size_t(y) * width * 4];
+        for (uint32_t x = 0; x < width; ++x) {
+          uint16_t v = 0;
+          std::memcpy(&v, src_row + size_t(x) * 2, 2);
+          uint8_t* o = dst_row + size_t(x) * 4;
+          if (expand16 == 1) {
+            o[0] = ExpandBits(v & 31, 5); o[1] = ExpandBits((v >> 5) & 63, 6);
+            o[2] = ExpandBits(v >> 11, 5); o[3] = 255;
+          } else if (expand16 == 2) {
+            o[0] = ExpandBits(v & 31, 5); o[1] = ExpandBits((v >> 5) & 31, 5);
+            o[2] = ExpandBits((v >> 10) & 31, 5); o[3] = (v >> 15) ? 255 : 0;
+          } else {
+            for (int k = 0; k < 4; ++k) o[k] = ExpandBits((v >> (k * 4)) & 15, 4);
+          }
         }
       }
       upload_ptr = tex_upload_rgba_.data();
-      row_bytes = width * 4;
+      upload_row_bytes = width * 4;
     } else if (decode_dxt != 0) {
       const uint32_t dec_w = std::max(4u, blocks_x * 4);
       const uint32_t dec_h = std::max(4u, blocks_y * 4);
@@ -1915,7 +2174,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       tex_upload_rgba_.resize(size_t(dec_stride) * dec_h);
       for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
-          DecodeDxtBlockToRgba(decode_dxt, &tex_upload_blocks_[(size_t(by) * blocks_x + bx) * bpb],
+          DecodeDxtBlockToRgba(decode_dxt,
+                               &tex_upload_blocks_[size_t(by) * upload_row_bytes + size_t(bx) * bpb],
                                &tex_upload_rgba_[(size_t(by) * 4 * dec_w + bx * 4) * 4], dec_stride);
         }
       }
@@ -1929,7 +2189,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       } else {
         upload_ptr = tex_upload_rgba_.data();
       }
-      row_bytes = width * 4;
+      upload_row_bytes = width * 4;
     }
 
     int target_slot = 0;
@@ -1989,12 +2249,12 @@ class MetalCommandProcessor final : public CommandProcessor {
       entry.height = height;
       entry.swizzle = fetch.swizzle;
     }
-    if (!dst_tex || !upload_ptr || row_bytes == 0) return nil;
+    if (!dst_tex || !upload_ptr || upload_row_bytes == 0) return nil;
     ++frame_tex_uploads_;
     [dst_tex replaceRegion:MTLRegionMake2D(0, 0, width, height)
                mipmapLevel:0
                  withBytes:upload_ptr
-               bytesPerRow:row_bytes];
+               bytesPerRow:upload_row_bytes];
     entry.active_slot = target_slot;
     entry.slot_used_gen[target_slot] = generation_;
     return dst_tex;
@@ -2027,9 +2287,13 @@ class MetalCommandProcessor final : public CommandProcessor {
   }
 
   id<MTLRenderCommandEncoder> BeginPass(id<MTLTexture> const colors[4], id<MTLTexture> depth,
-                                        uint32_t right, uint32_t bottom) {
+                                        uint32_t right, uint32_t bottom, uint32_t guest_w,
+                                        uint32_t guest_h) {
     bool same = encoder_ && depth == pass_depth_ && right <= pass_w_ && bottom <= pass_h_;
-    for (int i = 0; i < 4 && same; ++i) same = (colors[i] == pass_colors_[i]);
+    for (int i = 0; i < 4 && same; ++i) {
+      same = (colors[i] == pass_colors_[i]) &&
+             !(colors[i] && pending_color_clears_.count((__bridge void*)colors[i]));
+    }
     if (same && !(depth && pending_depth_clears_.count((__bridge void*)depth))) {
       return encoder_;
     }
@@ -2043,7 +2307,16 @@ class MetalCommandProcessor final : public CommandProcessor {
       max_w = std::min(max_w, uint32_t(tex.width));
       max_h = std::min(max_h, uint32_t(tex.height));
     };
-    for (int i = 0; i < 4; ++i) if (colors[i]) inc(colors[i]);
+    for (int i = 0; i < 4; ++i) {
+      if (colors[i]) {
+        inc(colors[i]);
+        if (auto it = pending_color_clears_.find((__bridge void*)colors[i]);
+            it != pending_color_clears_.end()) {
+          right = std::max(right, it->second.right);
+          bottom = std::max(bottom, it->second.bottom);
+        }
+      }
+    }
     if (depth) {
       inc(depth);
       if (auto it = pending_depth_clears_.find((__bridge void*)depth); it != pending_depth_clears_.end()) {
@@ -2057,6 +2330,8 @@ class MetalCommandProcessor final : public CommandProcessor {
     if (depth) drawn_extents_[(__bridge void*)depth] = {right, bottom};
     pass_w_ = right;
     pass_h_ = bottom;
+    pass_guest_w_ = guest_w;
+    pass_guest_h_ = guest_h;
 
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.renderTargetWidth = right;
@@ -2065,7 +2340,18 @@ class MetalCommandProcessor final : public CommandProcessor {
       pass_colors_[i] = colors[i];
       if (!colors[i]) continue;
       pass.colorAttachments[i].texture = colors[i];
-      pass.colorAttachments[i].loadAction = MTLLoadActionLoad;
+      auto it = pending_color_clears_.find((__bridge void*)colors[i]);
+      const bool clr = (it != pending_color_clears_.end());
+      if (clr) {
+        const uint32_t c = it->second.value;
+        pending_color_clears_.erase(it);
+        pass.colorAttachments[i].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[i].clearColor = MTLClearColorMake(
+            (c & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
+            ((c >> 16) & 0xFF) / 255.0, (c >> 24) / 255.0);
+      } else {
+        pass.colorAttachments[i].loadAction = MTLLoadActionLoad;
+      }
       pass.colorAttachments[i].storeAction = MTLStoreActionStore;
     }
     pass_depth_ = depth;
@@ -2087,6 +2373,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     [encoder_ setVertexBuffer:gpu_mem_ offset:0 atIndex:4];
     [encoder_ setVertexBuffer:(gpu_mem_hi_ ? gpu_mem_hi_ : gpu_mem_) offset:0 atIndex:5];
     ResetConstCache();
+    ResetEncoderState();
     return encoder_;
   }
 
@@ -2269,6 +2556,22 @@ class MetalCommandProcessor final : public CommandProcessor {
   id<MTLTexture> pass_colors_[4]{};
   id<MTLTexture> pass_depth_ = nil;
   uint32_t pass_w_ = 0, pass_h_ = 0;
+  uint32_t pass_guest_w_ = 0, pass_guest_h_ = 0;
+  uint32_t last_resolved_guest_w_ = 0, last_resolved_guest_h_ = 0;
+  uint32_t scale_num_ = 1, scale_den_ = 1;
+  id<MTLRenderPipelineState> enc_pipeline_ = nil;
+  id<MTLDepthStencilState> enc_depth_state_ = nil;
+  uint32_t enc_stencil_f_ = UINT32_MAX, enc_stencil_b_ = UINT32_MAX;
+  MTLCullMode enc_cull_ = MTLCullMode(99);
+  MTLWinding enc_winding_ = MTLWinding(99);
+  bool enc_has_vp_ = false;
+  MTLViewport enc_vp_{};
+  bool enc_has_sc_ = false;
+  MTLScissorRect enc_sc_{};
+  bool enc_has_blend_ = false;
+  float enc_blend_[4]{};
+  id<MTLTexture> enc_tex_[32]{};
+  id<MTLSamplerState> enc_samp_[32]{};
   id<MTLTexture> dummy_tex_ = nil;
   id<MTLComputePipelineState> resolve_pso_ = nil;
   id<MTLComputePipelineState> clear_pso_ = nil;
@@ -2289,9 +2592,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, TexEntry> textures_;
   std::unordered_map<uint64_t, id<MTLSamplerState>> samplers_;
   std::unordered_map<uint32_t, ResolvedTarget> resolved_;
-  std::unordered_map<uint64_t, id<MTLTexture>> targets_;
+  std::unordered_map<uint64_t, TargetEntry> targets_;
   std::unordered_map<void*, std::pair<uint32_t, uint32_t>> drawn_extents_;
   std::unordered_map<void*, DepthClear> pending_depth_clears_;
+  std::unordered_map<void*, ColorClear> pending_color_clears_;
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
   std::unordered_set<uint64_t> failed_pipelines_;
   std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_states_;
@@ -2373,6 +2677,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t enc_vs_off_ = UINT32_MAX, enc_ps_off_ = UINT32_MAX;
   uint32_t enc_bool_off_ = UINT32_MAX, enc_fetch_off_ = UINT32_MAX;
 
+  std::vector<uint8_t> tex_raw_staging_;
   std::vector<uint8_t> tex_upload_blocks_;
   std::vector<uint8_t> tex_upload_rgba_;
   uint32_t frame_draws_ = 0;

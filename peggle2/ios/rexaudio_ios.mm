@@ -12,8 +12,6 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
-#include <queue>
-#include <stack>
 #include <thread>
 #include <vector>
 
@@ -194,17 +192,20 @@ class IOSAudioDriver final : public rex::audio::AudioDriver {
       return;
     }
     const auto* input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
-    float* out_buf = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (unused_.empty()) {
-        out_buf = new float[kFrameSamples];
-      } else {
-        out_buf = unused_.top();
-        unused_.pop();
-      }
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    if (effective_paused_.load(std::memory_order_acquire)) {
+      if (semaphore_) semaphore_->Release(1, nullptr);
+      return;
+    }
+    const uint32_t w = write_idx_.load(std::memory_order_relaxed);
+    const uint32_t r = read_idx_.load(std::memory_order_acquire);
+    if (w - r >= kQueueCapacity) {
+      // Ring full: drop oldest-uncommitted incoming frame rather than blocking or racing read_idx_.
+      if (semaphore_) semaphore_->Release(1, nullptr);
+      return;
     }
 
+    float* out_buf = frames_[w & kQueueMask].data();
     // Sanitize NaN/Inf and tanhf soft-clip in guest BE float space so heavy bursts never hard-clip.
     for (size_t i = 0; i < kFrameSamples; ++i) {
       float s = rex::byte_swap(input_frame[i]);
@@ -217,19 +218,7 @@ class IOSAudioDriver final : public rex::audio::AudioDriver {
     }
 
     rex::ui::Presenter::RecordSubmittedAudioFrame();
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (effective_paused_.load(std::memory_order_acquire)) {
-      unused_.push(out_buf);
-      if (semaphore_) semaphore_->Release(1, nullptr);
-      return;
-    }
-    while (queued_.size() > 16) {
-      unused_.push(queued_.front());
-      queued_.pop();
-      if (semaphore_) semaphore_->Release(1, nullptr);
-    }
-    queued_.push(out_buf);
+    write_idx_.store(w + 1u, std::memory_order_release);
   }
 
  private:
@@ -305,42 +294,18 @@ class IOSAudioDriver final : public rex::audio::AudioDriver {
   }
 
   void FlushQueuedFrames(bool release_semaphores) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (release_semaphores) {
-      if (current_) {
-        unused_.push(current_);
-        current_ = nullptr;
-        if (semaphore_) semaphore_->Release(1, nullptr);
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    const uint32_t r = read_idx_.load(std::memory_order_acquire);
+    const uint32_t w = write_idx_.load(std::memory_order_relaxed);
+    if (release_semaphores && semaphore_) {
+      for (uint32_t i = r; i != w; ++i) {
+        semaphore_->Release(1, nullptr);
       }
-      while (!queued_.empty()) {
-        unused_.push(queued_.front());
-        queued_.pop();
-        if (semaphore_) semaphore_->Release(1, nullptr);
-      }
-      current_offset_ = 0;
-      downmixed_ready_ = false;
-      if (!stereo_scratch_.empty()) {
-        stereo_scratch_.fill(0.0f);
-      }
-      return;
     }
-    if (current_) {
-      delete[] current_;
-      current_ = nullptr;
-    }
+    read_idx_.store(w, std::memory_order_release);
     current_offset_ = 0;
     downmixed_ready_ = false;
-    if (!stereo_scratch_.empty()) {
-      stereo_scratch_.fill(0.0f);
-    }
-    while (!queued_.empty()) {
-      delete[] queued_.front();
-      queued_.pop();
-    }
-    while (!unused_.empty()) {
-      delete[] unused_.top();
-      unused_.pop();
-    }
+    stereo_scratch_.fill(0.0f);
   }
 
   void RestartOutputUnit(bool reactivate_session) {
@@ -409,31 +374,20 @@ class IOSAudioDriver final : public rex::audio::AudioDriver {
       return;
     }
     UInt32 written = 0;
-    std::lock_guard<std::mutex> lock(mutex_);
     while (written < num_frames) {
-      if (!current_) {
-        if (queued_.empty()) {
+      if (!downmixed_ready_) {
+        const uint32_t r = read_idx_.load(std::memory_order_relaxed);
+        const uint32_t w = write_idx_.load(std::memory_order_acquire);
+        if (r == w) {
           break;
         }
-        current_ = queued_.front();
-        queued_.pop();
-        current_offset_ = 0;
-        downmixed_ready_ = false;
-        if (semaphore_) semaphore_->Release(1, nullptr);
-      }
-      if (!current_) break;
-      if (current_offset_ >= kChannelSamples) {
-        unused_.push(current_);
-        current_ = nullptr;
-        current_offset_ = 0;
-        downmixed_ready_ = false;
-        continue;
-      }
-      if (current_offset_ == 0 && !downmixed_ready_) {
         static const rex::audio::StereoFold kStereo{};
         rex::audio::conversion::sequential_6_BE_to_interleaved_2_LE(
-            stereo_scratch_.data(), current_, kChannelSamples, kStereo, 1.0f);
+            stereo_scratch_.data(), frames_[r & kQueueMask].data(), kChannelSamples, kStereo, 1.0f);
+        read_idx_.store(r + 1u, std::memory_order_release);
+        current_offset_ = 0;
         downmixed_ready_ = true;
+        if (semaphore_) semaphore_->Release(1, nullptr);
       }
       const UInt32 avail = UInt32(kChannelSamples - current_offset_);
       const UInt32 take = std::min(avail, num_frames - written);
@@ -445,21 +399,22 @@ class IOSAudioDriver final : public rex::audio::AudioDriver {
       written += take;
       current_offset_ += take;
       if (current_offset_ >= kChannelSamples) {
-        unused_.push(current_);
-        current_ = nullptr;
         current_offset_ = 0;
         downmixed_ready_ = false;
       }
     }
   }
 
+  static constexpr uint32_t kQueueCapacity = 32;
+  static constexpr uint32_t kQueueMask = kQueueCapacity - 1u;
+
   rex::thread::Semaphore* semaphore_ = nullptr;
   AudioComponentInstance unit_ = nullptr;
   std::mutex unit_mutex_;
-  std::mutex mutex_;
-  std::queue<float*> queued_;
-  std::stack<float*> unused_;
-  float* current_ = nullptr;
+  std::mutex submit_mutex_;
+  std::array<std::array<float, kFrameSamples>, kQueueCapacity> frames_{};
+  std::atomic<uint32_t> write_idx_{0};
+  std::atomic<uint32_t> read_idx_{0};
   size_t current_offset_ = 0;
   bool downmixed_ready_ = false;
   bool silent_fallback_ = false;

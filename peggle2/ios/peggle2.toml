@@ -1,2 +1,4 @@
 license_mask = 1
 vsync = true
+occlusion_query_enable = false
+async_shader_compilation = true
