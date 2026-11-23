@@ -81,9 +81,13 @@ jobs:
           $clangCxx = (Get-Command "clang++.exe").Source -replace '\\', '/'
           Add-Content -Path $env:GITHUB_ENV -Value "CC=$clangC"
           Add-Content -Path $env:GITHUB_ENV -Value "CXX=$clangCxx"
-          & $clangCxx --version
-          cmake --version
-          ninja --version
+          $clangVer = (& $clangCxx --version | Select-Object -First 1)
+          $cmakeVer = (cmake --version | Select-Object -First 1)
+          $ninjaVer = (ninja --version | Select-Object -First 1)
+          Write-Host "::notice::Toolchain: $clangVer | $cmakeVer | ninja $ninjaVer | VS=$vsPath | CC=$clangC"
+          Write-Host $clangVer
+          Write-Host $cmakeVer
+          Write-Host "ninja $ninjaVer"
 
       - name: Cache ReXGlue SDK Windows x64 install
         id: sdk-cache
@@ -147,19 +151,39 @@ jobs:
           $sdkBuild = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-build") -replace '\\', '/'
           $sdkInstall = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-install") -replace '\\', '/'
 
-          cmake -S $sdkDir -B $sdkBuild -G "Ninja Multi-Config" `
-            -DCMAKE_C_COMPILER="$env:CC" `
-            -DCMAKE_CXX_COMPILER="$env:CXX" `
-            -DCMAKE_C_FLAGS="-march=x86-64-v3" `
-            -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
-            -DCMAKE_INSTALL_PREFIX="$sdkInstall"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          function Invoke-Logged {
+            param([string]$Label, [scriptblock]$Cmd)
+            $log = Join-Path $env:RUNNER_TEMP "ci-$Label.log"
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+              & $Cmd 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+              $rc = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $prevEap
+            }
+            if ($rc -ne 0) {
+              $errLines = Get-Content $log | Where-Object { $_ -match 'FAILED:|fatal error:|error:|FATAL_ERROR|CMake Error|LNK\d+|lld-link|undefined symbol' } | Select-Object -Last 8
+              if (-not $errLines) { $errLines = Get-Content $log | Select-Object -Last 8 }
+              foreach ($l in $errLines) { Write-Host "::error::[$Label] $l" }
+              exit $rc
+            }
+          }
 
-          cmake --build $sdkBuild --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          cmake --install $sdkBuild --config Release --prefix "$sdkInstall"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Invoke-Logged "sdk-configure" {
+            cmake -S $sdkDir -B $sdkBuild -G "Ninja Multi-Config" `
+              -DCMAKE_C_COMPILER="$env:CC" `
+              -DCMAKE_CXX_COMPILER="$env:CXX" `
+              -DCMAKE_C_FLAGS="-march=x86-64-v3" `
+              -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
+              -DCMAKE_INSTALL_PREFIX="$sdkInstall"
+          }
+          Invoke-Logged "sdk-build" {
+            cmake --build $sdkBuild --config Release --parallel
+          }
+          Invoke-Logged "sdk-install" {
+            cmake --install $sdkBuild --config Release --prefix "$sdkInstall"
+          }
 
       - name: Verify generated recompiled guest sources exist
         shell: pwsh
@@ -173,23 +197,44 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           $sdkInstall = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-install") -replace '\\', '/'
           if (-not (Test-Path "$sdkInstall/lib/cmake/rexglue/rexglueConfig.cmake")) {
             throw "rexglueConfig.cmake missing in $sdkInstall"
           }
 
-          cmake -S peggle2 -B build-win -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER="$env:CC" `
-            -DCMAKE_CXX_COMPILER="$env:CXX" `
-            -DCMAKE_C_FLAGS="-march=x86-64-v3" `
-            -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
-            -DCMAKE_PREFIX_PATH="$sdkInstall" `
-            -Drexglue_DIR="$sdkInstall/lib/cmake/rexglue"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          function Invoke-Logged {
+            param([string]$Label, [scriptblock]$Cmd)
+            $log = Join-Path $env:RUNNER_TEMP "ci-$Label.log"
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+              & $Cmd 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+              $rc = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $prevEap
+            }
+            if ($rc -ne 0) {
+              $errLines = Get-Content $log | Where-Object { $_ -match 'FAILED:|fatal error:|error:|FATAL_ERROR|CMake Error|LNK\d+|lld-link|undefined symbol' } | Select-Object -Last 8
+              if (-not $errLines) { $errLines = Get-Content $log | Select-Object -Last 8 }
+              foreach ($l in $errLines) { Write-Host "::error::[$Label] $l" }
+              exit $rc
+            }
+          }
 
-          cmake --build build-win --parallel
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Invoke-Logged "app-configure" {
+            cmake -S peggle2 -B build-win -G "Ninja" `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_C_COMPILER="$env:CC" `
+              -DCMAKE_CXX_COMPILER="$env:CXX" `
+              -DCMAKE_C_FLAGS="-march=x86-64-v3" `
+              -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
+              -DCMAKE_PREFIX_PATH="$sdkInstall" `
+              -Drexglue_DIR="$sdkInstall/lib/cmake/rexglue"
+          }
+          Invoke-Logged "app-build" {
+            cmake --build build-win --parallel
+          }
 
       - name: Stage asset-free Peggle2-Windows-x64.zip & audit contents
         shell: pwsh
