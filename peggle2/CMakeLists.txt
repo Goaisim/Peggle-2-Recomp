@@ -145,15 +145,57 @@ if(APPLE AND IOS)
         XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY ""
     )
 else()
-    include(generated/rexglue.cmake)
-
     if(WIN32)
         add_executable(peggle2 WIN32 ${PEGGLE2_SOURCES} resources/peggle2.rc)
     else()
         add_executable(peggle2 ${PEGGLE2_SOURCES})
     endif()
 
-    rexglue_setup_target(peggle2 GPU_PLUGINS xenos)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../game/default.xex"
+       OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/sources.cmake")
+        include(generated/rexglue.cmake)
+        rexglue_setup_target(peggle2 GPU_PLUGINS xenos)
+    else()
+        # Asset-free builds (CI and clean GitHub checkouts without ../game/default.xex)
+        # compile committed generated/default C++ sources without registering a codegen edge.
+        if(REXSDK_DIR)
+            add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
+        else()
+            find_package(rexglue 0.10.0 REQUIRED CONFIG)
+        endif()
+        include(generated/default/sources.cmake)
+        add_library(peggle2_recomp OBJECT ${GENERATED_SOURCES})
+        target_include_directories(peggle2_recomp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/generated/default
+        )
+        target_link_libraries(peggle2_recomp PRIVATE rex::runtime)
+        rexglue_apply_target_settings(peggle2_recomp)
+        if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            target_compile_options(peggle2_recomp PRIVATE -fasync-exceptions -gline-tables-only)
+        elseif(WIN32 AND MSVC)
+            target_compile_options(peggle2_recomp PRIVATE /EHa)
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(peggle2_recomp PRIVATE -gline-tables-only)
+        endif()
+        target_precompile_headers(peggle2_recomp PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/peggle2_pch.h")
+
+        target_include_directories(peggle2 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/generated/default
+        )
+        target_link_libraries(peggle2 PRIVATE peggle2_recomp rex::runtime)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons")
+            rexglue_embed_metadata(peggle2
+                DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons"
+                PREFIX "icons")
+        endif()
+        rexglue_configure_target(peggle2 GPU_PLUGINS xenos)
+    endif()
+
     target_compile_definitions(peggle2 PRIVATE REX_BUILD_SHA="${PEGGLE2_GIT_SHA}")
     target_compile_options(peggle2 PRIVATE $<$<CONFIG:Release>:-O3>)
 

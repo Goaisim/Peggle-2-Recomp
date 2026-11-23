@@ -115,7 +115,8 @@ jobs:
             thirdparty/imgui `
             thirdparty/sdl3 `
             thirdparty/o1heap `
-            thirdparty/tracy
+            thirdparty/tracy `
+            thirdparty/inja
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git -C $sdkDir apply --check $patchFile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -152,11 +153,6 @@ jobs:
           if (-not (Test-Path "$sdkInstall/lib/cmake/rexglue/rexglueConfig.cmake")) {
             throw "rexglueConfig.cmake missing in $sdkInstall"
           }
-
-          # Remove stale local codegen depfile and refresh generated stamps so Ninja uses committed C++ sources.
-          Remove-Item -Force "peggle2\generated\default\codegen.d" -ErrorAction SilentlyContinue
-          $now = Get-Date
-          Get-ChildItem "peggle2\generated\default\*" -File | ForEach-Object { $_.LastWriteTime = $now }
 
           cmake -S peggle2 -B build-win -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
