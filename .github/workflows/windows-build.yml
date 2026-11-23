@@ -35,7 +35,7 @@ permissions:
 jobs:
   build-windows-x64:
     name: Build Asset-Free Peggle2-Windows-x64.zip
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
@@ -45,6 +45,18 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          choco install llvm cmake ninja --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          $cmakeBin = "C:\Program Files\CMake\bin"
+          $chocoBin = "C:\ProgramData\chocolatey\bin"
+          foreach ($toolDir in @($llvmBin, $cmakeBin, $chocoBin)) {
+            if (Test-Path $toolDir) {
+              Add-Content -Path $env:GITHUB_PATH -Value $toolDir
+            }
+          }
+
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw "Visual Studio x64 build tools not found" }
@@ -64,18 +76,12 @@ jobs:
             }
           }
 
-          $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path (Join-Path $llvmBin "clang++.exe"))) {
-            $vsLlvm = Join-Path $vsPath "VC\Tools\Llvm\x64\bin"
-            if (Test-Path (Join-Path $vsLlvm "clang++.exe")) {
-              $llvmBin = $vsLlvm
-            } else {
-              throw "clang++.exe not found on runner"
-            }
-          }
-          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
-          $env:PATH = "$llvmBin;$env:PATH"
-          clang++ --version
+          $env:PATH = "$llvmBin;$cmakeBin;$chocoBin;$env:PATH"
+          $clangC = (Get-Command "clang.exe").Source -replace '\\', '/'
+          $clangCxx = (Get-Command "clang++.exe").Source -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "CC=$clangC"
+          Add-Content -Path $env:GITHUB_ENV -Value "CXX=$clangCxx"
+          & $clangCxx --version
           cmake --version
           ninja --version
 
@@ -84,13 +90,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}\rexglue-sdk-install
-          key: ${{ runner.os }}-x64-rexglue-f5337cd-${{ hashFiles('peggle2/ios/rexglue-sdk.patch') }}
+          key: windows-latest-x64-rexglue-f5337cd-${{ hashFiles('peggle2/ios/rexglue-sdk.patch') }}
 
-      - name: Build & install ReXGlue SDK with patch
+      - name: Clone & patch ReXGlue SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           $sdkDir = Join-Path $env:RUNNER_TEMP "rexglue-sdk"
           $sdkBuild = Join-Path $env:RUNNER_TEMP "rexglue-sdk-build"
           $sdkInstall = Join-Path $env:RUNNER_TEMP "rexglue-sdk-install"
@@ -98,7 +105,7 @@ jobs:
           $baseCommit = "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
 
           Remove-Item -Recurse -Force $sdkDir, $sdkBuild, $sdkInstall -ErrorAction SilentlyContinue
-          git clone https://github.com/rexglue/rexglue-sdk.git $sdkDir
+          git clone -c core.autocrlf=false https://github.com/rexglue/rexglue-sdk.git $sdkDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git -C $sdkDir checkout $baseCommit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -123,9 +130,19 @@ jobs:
           git -C $sdkDir apply $patchFile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Configure, build & install ReXGlue SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $sdkDir = (Join-Path $env:RUNNER_TEMP "rexglue-sdk") -replace '\\', '/'
+          $sdkBuild = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-build") -replace '\\', '/'
+          $sdkInstall = (Join-Path $env:RUNNER_TEMP "rexglue-sdk-install") -replace '\\', '/'
+
           cmake -S $sdkDir -B $sdkBuild -G "Ninja Multi-Config" `
-            -DCMAKE_C_COMPILER=clang `
-            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_COMPILER="$env:CC" `
+            -DCMAKE_CXX_COMPILER="$env:CXX" `
             -DCMAKE_C_FLAGS="-march=x86-64-v3" `
             -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
             -DCMAKE_INSTALL_PREFIX="$sdkInstall"
@@ -156,8 +173,8 @@ jobs:
 
           cmake -S peggle2 -B build-win -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=clang `
-            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_COMPILER="$env:CC" `
+            -DCMAKE_CXX_COMPILER="$env:CXX" `
             -DCMAKE_C_FLAGS="-march=x86-64-v3" `
             -DCMAKE_CXX_FLAGS="-march=x86-64-v3" `
             -DCMAKE_PREFIX_PATH="$sdkInstall" `
@@ -182,10 +199,10 @@ jobs:
 
           # Include standard VC++ x64 CRT DLLs if present so clean Windows installs launch out of the box.
           if ($env:VCToolsRedistDir) {
-            $crtDir = Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"
-            if (Test-Path $crtDir) {
+            $crtDir = Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($crtDir) {
               foreach ($dll in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_atomic_wait.dll")) {
-                $src = Join-Path $crtDir $dll
+                $src = Join-Path $crtDir.FullName $dll
                 if (Test-Path $src) { Copy-Item $src $stage }
               }
             }
