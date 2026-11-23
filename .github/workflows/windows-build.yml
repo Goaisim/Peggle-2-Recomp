@@ -101,7 +101,14 @@ jobs:
           $sdkDir = Join-Path $env:RUNNER_TEMP "rexglue-sdk"
           $sdkBuild = Join-Path $env:RUNNER_TEMP "rexglue-sdk-build"
           $sdkInstall = Join-Path $env:RUNNER_TEMP "rexglue-sdk-install"
-          $patchFile = Join-Path $env:GITHUB_WORKSPACE "peggle2\ios\rexglue-sdk.patch"
+          $patchFile = Join-Path $env:RUNNER_TEMP "rexglue-sdk-lf.patch"
+          $srcPatch = Join-Path $env:GITHUB_WORKSPACE "peggle2\ios\rexglue-sdk.patch"
+          [System.IO.File]::WriteAllBytes(
+            $patchFile,
+            ([System.Text.Encoding]::UTF8.GetBytes(
+              ([System.IO.File]::ReadAllText($srcPatch) -replace "`r`n", "`n")
+            ))
+          )
           $baseCommit = "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
 
           Remove-Item -Recurse -Force $sdkDir, $sdkBuild, $sdkInstall -ErrorAction SilentlyContinue
