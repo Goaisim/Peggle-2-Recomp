@@ -45,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          choco install llvm cmake ninja --no-progress -y
+          choco upgrade llvm --no-progress -y
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $llvmBin = "C:\Program Files\LLVM\bin"
