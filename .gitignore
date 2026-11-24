@@ -40,5 +40,6 @@ logs/
 *.log
 *.mp4
 *.png
+!peggle2/ios/Assets.xcassets/**/*.png
 /*.py
 input.txt
