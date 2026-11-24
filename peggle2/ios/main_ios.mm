@@ -836,22 +836,19 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
   if (!_displayLink) {
     return;
   }
+  const NSInteger screen_max_hz = std::max<NSInteger>(60, [UIScreen mainScreen].maximumFramesPerSecond);
+  const float max_hz = float(std::min<NSInteger>(120, screen_max_hz));
+  const float clamped_hz = (hz <= 40 && hz > 0) ? 40.0f : std::min<float>(hz == 0 ? 120.0f : float(hz), max_hz);
   if (@available(iOS 15.0, *)) {
-    if (hz == 0) {
-      const float max_hz = float(std::max<NSInteger>(60, [UIScreen mainScreen].maximumFramesPerSecond));
-      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, max_hz, max_hz);
-    } else if (hz <= 40) {
-      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(float(hz), float(hz), float(hz));
+    if (clamped_hz <= 40.0f) {
+      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(40, 40, 40);
     } else {
-      const float max_hz =
-          float(std::max<NSInteger>(hz, [UIScreen mainScreen].maximumFramesPerSecond));
-      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, max_hz, float(hz));
+      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, max_hz, clamped_hz);
     }
   } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    _displayLink.preferredFramesPerSecond =
-        (hz == 0) ? [UIScreen mainScreen].maximumFramesPerSecond : NSInteger(hz);
+    _displayLink.preferredFramesPerSecond = NSInteger(clamped_hz);
 #pragma clang diagnostic pop
   }
 }
@@ -1602,13 +1599,14 @@ static void UpdatePowerAndThermalState() {
 }
 
 void rex_ios_set_target_fps(uint32_t hz) {
-  if (g_ios_target_fps.exchange(hz, std::memory_order_relaxed) == hz) {
+  const uint32_t clamped = (hz > 0 && hz <= 40) ? 40u : ((hz == 0 || hz >= 120) ? 120u : 60u);
+  if (g_ios_target_fps.exchange(clamped, std::memory_order_relaxed) == clamped) {
     return;
   }
   dispatch_async(dispatch_get_main_queue(), ^{
     UIViewController* root = g_root_vc;
     if ([root isKindOfClass:[PeggleViewController class]]) {
-      [(PeggleViewController*)root updateDisplayLinkFrameRate:hz];
+      [(PeggleViewController*)root updateDisplayLinkFrameRate:clamped];
     }
   });
 }

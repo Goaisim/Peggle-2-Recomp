@@ -9178,7 +9178,7 @@ index e2983a4..b412b93 100644
  REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..7202d6d 100644
+index 8f2fcb0..bce6722 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -13,6 +13,7 @@
@@ -9197,7 +9197,7 @@ index 8f2fcb0..7202d6d 100644
  #include <rex/ui/window.h>
  #include <rex/ui/windowed_app_context.h>
  
-@@ -146,27 +148,53 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -146,27 +148,52 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                   reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
                                   reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
  
@@ -9215,9 +9215,9 @@ index 8f2fcb0..7202d6d 100644
 +  vsync_worker_running_.store(true, std::memory_order_release);
    vsync_worker_thread_ = system::object_ref<system::XHostThread>(
        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-         system::X_VIDEO_MODE video_mode;
-         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+-        system::X_VIDEO_MODE video_mode;
+-        kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
 -        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
 -        uint64_t vsync_interval_ticks =
 -            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
@@ -9228,17 +9228,15 @@ index 8f2fcb0..7202d6d 100644
 -          uint64_t interval_ticks =
 -              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
 -          while (current_time - last_frame_time >= interval_ticks) {
-+        const auto vsync_interval = std::chrono::nanoseconds(
-+            std::max<int64_t>(1'000'000LL, static_cast<int64_t>(1'000'000'000.0 / refresh_rate_hz)));
-+        const auto no_vsync_interval = std::chrono::milliseconds(1);
-+        auto last_vblank_tp = std::chrono::steady_clock::now();
++        // Xbox 360 guest VBlank cadence stays strictly locked to 60.0 Hz even when host VSync is off
++        // or the host monitor/presenter runs at 40/120/144 Hz.
++        constexpr auto kGuestVblankInterval = std::chrono::nanoseconds(16'666'667LL);
++        auto next_vblank_tp = std::chrono::steady_clock::now() + kGuestVblankInterval;
 +        while (vsync_worker_running_.load(std::memory_order_acquire)) {
-+          const auto interval = REXCVAR_GET(vsync) ? vsync_interval : no_vsync_interval;
 +          bool fire_vblank = false;
 +          {
 +            std::unique_lock<std::mutex> lock(vsync_mutex_);
-+            const auto next_tp = last_vblank_tp + interval;
-+            vsync_cv_.wait_until(lock, next_tp, [this]() {
++            vsync_cv_.wait_until(lock, next_vblank_tp, [this]() {
 +              return !vsync_worker_running_.load(std::memory_order_acquire) ||
 +                     vsync_flush_requested_;
 +            });
@@ -9247,14 +9245,18 @@ index 8f2fcb0..7202d6d 100644
 +            }
 +            const bool flushed = vsync_flush_requested_;
 +            vsync_flush_requested_ = false;
-+            if (flushed || std::chrono::steady_clock::now() >= next_tp) {
++            if (flushed || std::chrono::steady_clock::now() >= next_vblank_tp) {
 +              fire_vblank = true;
 +            }
 +          }
 +          if (fire_vblank) {
              MarkVblank();
 -            last_frame_time += interval_ticks;
-+            last_vblank_tp = std::chrono::steady_clock::now();
++            const auto now = std::chrono::steady_clock::now();
++            next_vblank_tp += kGuestVblankInterval;
++            if (now > next_vblank_tp + kGuestVblankInterval || now < next_vblank_tp - kGuestVblankInterval) {
++              next_vblank_tp = now + kGuestVblankInterval;
++            }
 +            {
 +              std::lock_guard<std::mutex> lock(vsync_mutex_);
 +              vblank_ack_seq_.fetch_add(1, std::memory_order_release);
@@ -9265,7 +9267,7 @@ index 8f2fcb0..7202d6d 100644
          }
          return 0;
        }));
-@@ -185,7 +213,13 @@ void GraphicsSystem::Shutdown() {
+@@ -185,7 +212,13 @@ void GraphicsSystem::Shutdown() {
    }
  
    if (vsync_worker_thread_) {
@@ -9280,7 +9282,7 @@ index 8f2fcb0..7202d6d 100644
      vsync_worker_thread_->Wait(0, 0, 0, nullptr);
      vsync_worker_thread_.reset();
    }
-@@ -319,6 +353,13 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -319,6 +352,13 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
  void GraphicsSystem::MarkVblank() {
    // TODO: Enable profiling once ported
    // SCOPE_profile_cpu_f("gpu");
@@ -9294,13 +9296,20 @@ index 8f2fcb0..7202d6d 100644
  
    // Increment vblank counter (so the game sees us making progress).
    if (command_processor_) {
-@@ -331,6 +372,52 @@ void GraphicsSystem::MarkVblank() {
+@@ -331,6 +371,59 @@ void GraphicsSystem::MarkVblank() {
    DispatchInterruptCallback(0, 2);
  }
  
 +void GraphicsSystem::NotifyGuestFrameSwap(bool flush_vblank_now) {
 +  if (!flush_vblank_now || !vsync_worker_running_.load(std::memory_order_acquire) ||
 +      interrupt_callback_ == 0) {
++    return;
++  }
++  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  const int64_t prev_ns = last_vblank_release_ns_.load(std::memory_order_acquire);
++  if (prev_ns > 0 && (now_ns - prev_ns) < 12'000'000LL) {
 +    return;
 +  }
 +  uint64_t target_seq = 0;
@@ -9347,7 +9356,7 @@ index 8f2fcb0..7202d6d 100644
  void GraphicsSystem::ClearCaches() {
    command_processor_->CallInThread([&]() { command_processor_->ClearCaches(); });
  }
-@@ -339,6 +426,14 @@ void GraphicsSystem::InvalidateGpuMemory() {
+@@ -339,6 +432,14 @@ void GraphicsSystem::InvalidateGpuMemory() {
    command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
  }
  
@@ -11092,7 +11101,7 @@ index 57fd161..ef9de6f 100644
                                      timeout_ptr ? &timeout : nullptr);
    } else {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 1254710..298c8ce 100644
+index 1254710..6278295 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -14,9 +14,21 @@
@@ -11137,7 +11146,7 @@ index 1254710..298c8ce 100644
    }
  }
  }  // namespace
-@@ -437,6 +452,96 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
+@@ -437,6 +452,99 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
    return 0;
  }
  
@@ -11168,16 +11177,19 @@ index 1254710..298c8ce 100644
 +  }
 +  const auto guest_interval =
 +      std::chrono::nanoseconds(static_cast<int64_t>(16666667.0 / scalar));
-+  const auto max_debt_clamp = std::chrono::milliseconds(50);
++  const auto max_debt_clamp = guest_interval;
 +
 +  std::chrono::steady_clock::time_point deadline;
 +  {
 +    std::lock_guard<std::mutex> lock(s_guest_pacer_mutex);
 +    const auto now = std::chrono::steady_clock::now();
 +    if (force_no_sleep) {
-+      if (!s_pacer_initialized || now >= s_next_guest_deadline) {
++      if (!s_pacer_initialized || now > s_next_guest_deadline + max_debt_clamp) {
 +        s_next_guest_deadline = now + guest_interval;
 +        s_pacer_initialized = true;
++      } else {
++        s_next_guest_deadline =
++            std::min(s_next_guest_deadline + guest_interval, now + guest_interval);
 +      }
 +      return 0.0f;
 +    }
@@ -11185,7 +11197,7 @@ index 1254710..298c8ce 100644
 +      s_next_guest_deadline = now + guest_interval;
 +      s_pacer_initialized = true;
 +    } else if (now > s_next_guest_deadline + max_debt_clamp) {
-+      // Preserve up to 50 ms of real-time catch-up debt without spiraling.
++      // Recover at most one missed 60 Hz interval without multi-frame catch-up bursts.
 +      s_next_guest_deadline = now - max_debt_clamp;
 +    }
 +    deadline = s_next_guest_deadline;
@@ -11234,7 +11246,7 @@ index 1254710..298c8ce 100644
  void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                    mapped_void unk2,            // system writeback ptr
-@@ -445,6 +550,129 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -445,6 +553,128 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                    mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                    mapped_u32 height) {
@@ -11355,8 +11367,7 @@ index 1254710..298c8ce 100644
 +
 +  // Catch-up immediately (0 ms sleep) while physics time debt remains > 0, then
 +  // flush a phase-locked VBlank before returning so the guest swap wait doesn't stall.
-+  s_prev_limiter_sleep_ms =
-+      vblank_waited ? 0.0f : PaceGuestFrame60Hz(physics_time_debt_ms > 0.0f || next_frame_skip);
++  s_prev_limiter_sleep_ms = vblank_waited ? 0.0f : PaceGuestFrame60Hz(next_frame_skip);
 +  if (!vblank_waited && graphics_system) {
 +    graphics_system->NotifyGuestFrameSwap(true);
 +  }
@@ -11364,7 +11375,7 @@ index 1254710..298c8ce 100644
    // All of these parameters are REQUIRED.
    assert(buffer_ptr);
    assert(fetch_ptr);
-@@ -459,20 +687,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -459,20 +689,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    memory::copy_and_swap_32_unaligned(&gpu_fetch,
                                       reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
  
@@ -11385,7 +11396,7 @@ index 1254710..298c8ce 100644
      REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
                    frontbuffer_virtual_address);
      return;
-@@ -487,11 +707,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -487,11 +709,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    assert_true(*width == 1 + gpu_fetch.size_2d.width);
    assert_true(*height == 1 + gpu_fetch.size_2d.height);
  
@@ -11397,7 +11408,7 @@ index 1254710..298c8ce 100644
    buffer_ptr.Zero(64 * 4);
  
    uint32_t offset = 0;
-@@ -507,12 +722,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -507,12 +724,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    dwords[offset++] = gpu_fetch.dword_4;
    dwords[offset++] = gpu_fetch.dword_5;
  
@@ -11412,7 +11423,7 @@ index 1254710..298c8ce 100644
  
    // Fill the rest of the buffer with NOP packets.
    for (uint32_t i = offset; i < 64; i++) {
-@@ -582,3 +798,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
+@@ -582,3 +800,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
  REX_EXPORT(__imp__VdRetrainEDRAMWorker, rex::kernel::xboxkrnl::VdRetrainEDRAMWorker_entry)
  REX_EXPORT(__imp__VdRetrainEDRAM, rex::kernel::xboxkrnl::VdRetrainEDRAM_entry)
  REX_EXPORT(__imp__VdSwap, rex::kernel::xboxkrnl::VdSwap_entry)
@@ -13830,7 +13841,7 @@ index 43d6c06..ff5b2d9 100644
        auto stats = stats_provider_();
        if (stats.frame_count > 0) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..ab56cc5 100644
+index 7360ed9..fc089c0 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,15 +12,29 @@
@@ -14051,7 +14062,7 @@ index 7360ed9..ab56cc5 100644
  }
  
  void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnectionState new_state) {
-@@ -1494,10 +1575,185 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
+@@ -1494,10 +1575,172 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
  #endif  // XE_PLATFORM
  }
  
@@ -14173,21 +14184,7 @@ index 7360ed9..ab56cc5 100644
 +    }
 +    last_presented_guest_swap_ = cur_swaps;
 +    last_host_present_time_ = now;
-+  } else if (guest_active && target_fps == 40) {
-+    const auto now = std::chrono::steady_clock::now();
-+    const bool is_new_frame = s_new_guest_frame_ready.exchange(false, std::memory_order_acq_rel);
-+    const double elapsed_ms =
-+        std::chrono::duration<double, std::milli>(now - last_host_present_time_).count();
-+    if ((!is_new_frame && elapsed_ms < 35.0) || elapsed_ms < 20.0) {
-+      if (execute_ui_drawers) {
-+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-+        request_ui_paint_after_current_ui_thread_paint_ = true;
-+      }
-+      return PaintResult::kPresented;
-+    }
-+    last_presented_guest_swap_ = guest_vdswap_count();
-+    last_host_present_time_ = now;
-+  } else if (guest_active && target_fps > 0 && target_fps <= 60) {
++  } else if (guest_active && target_fps > 0 && target_fps <= 60 && target_fps != 40) {
 +    const auto now = std::chrono::steady_clock::now();
 +    bool is_new_frame = s_new_guest_frame_ready.exchange(false, std::memory_order_acq_rel);
 +    if (!is_new_frame) {
@@ -14204,6 +14201,7 @@ index 7360ed9..ab56cc5 100644
 +    last_presented_guest_swap_ = guest_vdswap_count();
 +    last_host_present_time_ = now;
 +  } else if (guest_active) {
++    // Handles 40 Hz (ApplyFramePacing targets 25.0 ms cleanly while CP skips 1-of-3 swaps) and >60 Hz / uncapped.
 +    s_new_guest_frame_ready.store(false, std::memory_order_relaxed);
 +    last_presented_guest_swap_ = guest_vdswap_count();
 +    last_host_present_time_ = std::chrono::steady_clock::now();
@@ -14237,7 +14235,7 @@ index 7360ed9..ab56cc5 100644
    switch (result) {
      case PaintResult::kPresented:
        surface_paint_connection_was_optimal_at_successful_paint_ = true;
-@@ -1663,5 +1919,361 @@ void Presenter::DXGIUITickThread() {
+@@ -1663,5 +1906,361 @@ void Presenter::DXGIUITickThread() {
  }
  #endif  // XE_PLATFORM
  

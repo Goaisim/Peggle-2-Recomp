@@ -186,16 +186,22 @@ struct FpsPresetInfo {
 static const FpsPresetInfo kFpsPresets[kFpsCount] = {
   { "30 Hz",    30, std::chrono::nanoseconds(33333333), 1.0f / 60.0f, 16.666666f },
   { "60 Hz",    60, std::chrono::nanoseconds(16666667), 1.0f / 60.0f, 16.666666f },
-  { "72 Hz",    72, std::chrono::nanoseconds(13888889), 1.0f / 72.0f, 13.888889f },
-  { "120 Hz",  120, std::chrono::nanoseconds(8333333),  1.0f / 120.0f, 8.333333f },
-  { "144 Hz",  144, std::chrono::nanoseconds(6944444),  1.0f / 144.0f, 6.944444f },
+  { "72 Hz",    72, std::chrono::nanoseconds(13888889), 1.0f / 60.0f, 16.666666f },
+  { "120 Hz",  120, std::chrono::nanoseconds(8333333),  1.0f / 60.0f, 16.666666f },
+  { "144 Hz",  144, std::chrono::nanoseconds(6944444),  1.0f / 60.0f, 16.666666f },
   { "Uncapped",  0, std::chrono::nanoseconds(0),        1.0f / 60.0f, 16.666666f },
   { "40 Hz",    40, std::chrono::nanoseconds(25000000), 1.0f / 60.0f, 16.666666f },
 };
 
+#if REX_PLATFORM_IOS
+static constexpr int kFpsCycleOrder[] = {
+  kFps40, kFps60, kFps120,
+};
+#else
 static constexpr int kFpsCycleOrder[] = {
   kFps40, kFps60, kFps72, kFps120, kFps144, kFpsUncapped,
 };
+#endif
 
 static int StepFpsPresetIndex(int cur, int dir) {
   constexpr int n = int(sizeof(kFpsCycleOrder) / sizeof(kFpsCycleOrder[0]));
@@ -213,10 +219,17 @@ static int TargetFpsIndexFromHz(int32_t hz) {
   switch (hz) {
     case 40: return kFps40;
     case 60: return kFps60;
+#if REX_PLATFORM_IOS
+    case 72: return kFps60;
+    case 120:
+    case 144:
+    case 0: return kFps120;
+#else
     case 72: return kFps72;
     case 120: return kFps120;
     case 144: return kFps144;
     case 0: return kFpsUncapped;
+#endif
     default: return -1;
   }
 }
@@ -387,6 +400,13 @@ static void LoadUserSettings(const std::filesystem::path& path) {
               val = kDefaultTargetFpsIdx;
               reset_saved_30hz = true;
             }
+#if REX_PLATFORM_IOS
+            if (val == kFps72) {
+              val = kFps60;
+            } else if (val == kFps144 || val == kFpsUncapped) {
+              val = kFps120;
+            }
+#endif
           }
 #if !REX_PLATFORM_IOS
           if (key == "edram_mode") {
@@ -1541,9 +1561,22 @@ static void RunColliderSelfCheck() {
     TC_ASSERT(kFpsPresets[kFps30].dt_sec <= 0.017f);
     TC_ASSERT(kFpsPresets[kFps40].hz == 40);
     TC_ASSERT(kFpsPresets[kFps40].dt_sec <= 0.017f);
+    TC_ASSERT(kFpsPresets[kFps60].dt_sec <= 0.017f);
+    TC_ASSERT(kFpsPresets[kFps120].dt_sec <= 0.017f);
+    TC_ASSERT(kFpsPresets[kFps144].dt_sec <= 0.017f);
+    TC_ASSERT(kFps120 == 3 && kFps144 == 4 && kFps40 == 6);
     TC_ASSERT(StepFpsPresetIndex(kFps40, 1) == kFps60);
     TC_ASSERT(StepFpsPresetIndex(kFps60, -1) == kFps40);
+#if REX_PLATFORM_IOS
+    TC_ASSERT(StepFpsPresetIndex(kFps60, 1) == kFps120);
+    TC_ASSERT(TargetFpsIndexFromHz(144) == kFps120);
+#else
+    TC_ASSERT(StepFpsPresetIndex(kFps120, 1) == kFps144);
+    TC_ASSERT(TargetFpsIndexFromHz(120) == kFps120);
+    TC_ASSERT(TargetFpsIndexFromHz(144) == kFps144);
+#endif
     TC_ASSERT(TargetFpsIndexFromHz(40) == kFps40);
+    TC_ASSERT(TargetFpsIndexFromHz(60) == kFps60);
     if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 8 (pause hover + visual turret + deadzone) passed\n");
     rex_monitor::ClearTestState();
   }
@@ -2257,9 +2290,8 @@ extern "C" REX_FUNC(sub_8261FE50) {
     rex::cvar::SetFlagByName("TargetFPS", std::to_string(target_hz));
     rex::cvar::SetFlagByName("target_fps", std::to_string(target_hz));
     rex::cvar::SetFlagByName("display_refresh_rate", std::to_string(target_hz));
-    rex::cvar::SetFlagByName(
-        "video_mode_refresh_rate",
-        std::to_string(target_hz > 0 ? (std::max)(60u, target_hz) : 240u));
+    // Keep Xbox 360 guest display/VBlank cadence locked to 60 Hz across all host refresh presets.
+    rex::cvar::SetFlagByName("video_mode_refresh_rate", "60");
 #if REX_PLATFORM_IOS
     rex_ios_set_target_fps(target_hz);
 #endif
@@ -2347,7 +2379,10 @@ DECLARE_REX_FUNC(sub_8242F2C8);
 extern "C" REX_FUNC(sub_8242F2C8) {
   REX_FUNC_PROLOGUE();
   g_current_frame.fetch_add(1, std::memory_order_relaxed);
-  g_f2c8_updates.fetch_add(1, std::memory_order_relaxed);
+  // Peggle 2 calls sub_8242F2C8 twice per 60 Hz frame (r4=0 pre-step at 0x8242F9D4, then main update at 0x8242FA0C).
+  if (static_cast<uint32_t>(ctx.lr) != 0x8242F9D4u) {
+    g_f2c8_updates.fetch_add(1, std::memory_order_relaxed);
+  }
   rex::SetGuestLastPC(0x8242F2C8u);
   rex::SetGuestLastLR(static_cast<uint32_t>(ctx.lr));
   rex::SetGuestThreadState(1);
@@ -3785,6 +3820,10 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
     if (int idx = TargetFpsIndexFromHz(REXCVAR_GET(target_fps)); idx >= 0) {
       g_target_fps_index.store(idx, std::memory_order_relaxed);
     }
+  } else if (rex::cvar::HasNonDefaultValue("TargetFPS")) {
+    if (int idx = TargetFpsIndexFromHz(REXCVAR_GET(TargetFPS)); idx >= 0) {
+      g_target_fps_index.store(idx, std::memory_order_relaxed);
+    }
   }
 #if !REX_PLATFORM_IOS
   if (!g_ini_had_edram_mode && rex::cvar::HasNonDefaultValue("render_target_path_d3d12")) {
@@ -3816,15 +3855,19 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   if (g_target_fps_index.load(std::memory_order_relaxed) == kFps30) {
     g_target_fps_index.store(kDefaultTargetFpsIdx, std::memory_order_relaxed);
   }
+#if REX_PLATFORM_IOS
+  if (int cur_idx = g_target_fps_index.load(std::memory_order_relaxed);
+      cur_idx == kFps72 || cur_idx == kFps144 || cur_idx == kFpsUncapped) {
+    g_target_fps_index.store(cur_idx == kFps72 ? kFps60 : kFps120, std::memory_order_relaxed);
+  }
+#endif
   const uint32_t startup_hz = GetActiveTargetFps();
   rex::cvar::SetFlagByName("vsync",
                            g_opt_vsync.load(std::memory_order_relaxed) == kVSyncOn ? "true" : "false");
   rex::cvar::SetFlagByName("TargetFPS", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("target_fps", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("display_refresh_rate", std::to_string(startup_hz));
-  rex::cvar::SetFlagByName(
-      "video_mode_refresh_rate",
-      std::to_string(startup_hz > 0 ? (std::max)(60u, startup_hz) : 240u));
+  rex::cvar::SetFlagByName("video_mode_refresh_rate", "60");
 #if REX_PLATFORM_IOS
   rex_ios_set_target_fps(startup_hz);
 #endif
