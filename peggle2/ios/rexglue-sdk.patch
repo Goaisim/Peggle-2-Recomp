@@ -1092,7 +1092,7 @@ index 4ce4f9b..1d9cf34 100644
  
  #define REX_EXPORT_STUB(name) \
 diff --git a/include/rex/logging/api.h b/include/rex/logging/api.h
-index be0497b..4249a6c 100644
+index be0497b..51b0fef 100644
 --- a/include/rex/logging/api.h
 +++ b/include/rex/logging/api.h
 @@ -13,8 +13,10 @@
@@ -1106,7 +1106,7 @@ index be0497b..4249a6c 100644
  
  #include <rex/cvar.h>
  
-@@ -252,4 +254,155 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
+@@ -252,4 +254,156 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
  std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
      const std::filesystem::path& config_path);
  
@@ -1240,6 +1240,7 @@ index be0497b..4249a6c 100644
 +void SetGpuFenceWait(bool waiting);
 +void SetCrashReportPath(const char* path);
 +void SetBuildSha(const char* sha);
++const char* GetRuntimeBuildTag();
 +void RecordGuestSignalFault(int sig, uint64_t fault_addr, uint64_t host_pc = 0,
 +                            uint64_t host_lr = 0, uint32_t fault_insn = 0,
 +                            uint32_t guest_pc = 0, uint32_t guest_lr = 0,
@@ -4539,7 +4540,7 @@ index ef5bdf4..67b7d09 100644
        info.total_size = 0;
      } else {
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 1645848..c8c7005 100644
+index 1645848..3da7d8a 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
 @@ -10,8 +10,13 @@
@@ -4591,7 +4592,7 @@ index 1645848..c8c7005 100644
  }
  
  void InitLogging(const char* log_file, spdlog::level::level_enum level) {
-@@ -561,4 +573,823 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
+@@ -561,4 +573,828 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
    return result;
  }
  
@@ -5198,6 +5199,11 @@ index 1645848..c8c7005 100644
 +
 +void SetBuildSha(const char* sha) {
 +  CopyBoundedCString(g_build_sha, sizeof(g_build_sha), (sha && sha[0]) ? sha : "unknown");
++}
++
++const char* GetRuntimeBuildTag() {
++  static constexpr const char kTag[] = "60hz@" __TIME__;
++  return kTag;
 +}
 +
 +void RecordGuestSignalFault(int sig, uint64_t fault_addr, uint64_t host_pc,
@@ -11107,7 +11113,7 @@ index 57fd161..ef9de6f 100644
                                      timeout_ptr ? &timeout : nullptr);
    } else {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 1254710..ac11ae2 100644
+index 1254710..615e987 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -14,9 +14,21 @@
@@ -11152,14 +11158,12 @@ index 1254710..ac11ae2 100644
    }
  }
  }  // namespace
-@@ -437,6 +452,87 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
+@@ -437,6 +452,83 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
    return 0;
  }
  
 +static std::chrono::steady_clock::time_point s_last_vdswap_arrive =
 +    std::chrono::steady_clock::now();
-+static std::atomic<bool> vblank_waited_this_frame{false};
-+static std::atomic<float> s_vblank_sleep_ms{0.0f};
 +static float s_prev_limiter_sleep_ms = 0.0f;
 +static std::mutex s_guest_pacer_mutex;
 +static std::chrono::steady_clock::time_point s_next_guest_deadline{};
@@ -11229,18 +11233,16 @@ index 1254710..ac11ae2 100644
 +}
 +
 +void VdBlockUntilVerticalBlank_entry() {
-+  if (!vblank_waited_this_frame.exchange(true, std::memory_order_acq_rel)) {
-+    s_vblank_sleep_ms.store(PaceGuestFrame60Hz(), std::memory_order_relaxed);
-+    if (auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system()) {
-+      graphics_system->NotifyGuestFrameSwap(true);
-+    }
++  // Never pace or skip VdSwap's 60.0 Hz ceiling here; VdSwap_entry owns guest swap pacing.
++  if (auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system()) {
++    graphics_system->NotifyGuestFrameSwap(true);
 +  }
 +}
 +
  void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                    mapped_void unk2,            // system writeback ptr
-@@ -445,6 +541,128 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -445,6 +537,125 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                    mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                    mapped_u32 height) {
@@ -11261,7 +11263,6 @@ index 1254710..ac11ae2 100644
 +    s_last_bg_pause_count = bg_pause_count;
 +    s_last_vdswap_arrive = now;
 +    s_prev_limiter_sleep_ms = 0.0f;
-+    s_vblank_sleep_ms.store(0.0f, std::memory_order_relaxed);
 +    physics_time_debt_ms = 0.0f;
 +    consecutive_skips = 0;
 +    prev_frame_skipped = false;
@@ -11275,8 +11276,7 @@ index 1254710..ac11ae2 100644
 +  const bool initial_swap = (total_vdswap_interval_ms <= 0.0f);
 +  s_last_vdswap_arrive = now;
 +
-+  const bool vblank_waited = vblank_waited_this_frame.exchange(false, std::memory_order_acq_rel);
-+  const float limiter_sleep_ms = s_prev_limiter_sleep_ms + s_vblank_sleep_ms.exchange(0.0f);
++  const float limiter_sleep_ms = s_prev_limiter_sleep_ms;
 +  const float active_work_ms = std::max(0.0f, total_vdswap_interval_ms - limiter_sleep_ms);
 +  const float kernel_wait_ms =
 +      static_cast<float>(rex::ui::Presenter::ConsumeCurrentThreadKernelWaitNs()) / 1000000.0f;
@@ -11359,17 +11359,16 @@ index 1254710..ac11ae2 100644
 +    graphics_system->set_skip_gpu_draw(next_frame_skip);
 +  }
 +
-+  // Enforce strict 60.0 Hz guest swap pacing regardless of host TargetFPS/VSync/Limiter, then
-+  // flush a phase-locked VBlank before returning so the guest swap wait doesn't stall.
-+  s_prev_limiter_sleep_ms = vblank_waited ? 0.0f : PaceGuestFrame60Hz();
-+  if (!vblank_waited && graphics_system) {
++  // Unconditionally enforce strict 60.0 Hz guest swap ceiling regardless of host TargetFPS/VSync/Limiter/VBlank.
++  s_prev_limiter_sleep_ms = PaceGuestFrame60Hz();
++  if (graphics_system) {
 +    graphics_system->NotifyGuestFrameSwap(true);
 +  }
 +
    // All of these parameters are REQUIRED.
    assert(buffer_ptr);
    assert(fetch_ptr);
-@@ -459,20 +677,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -459,20 +670,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    memory::copy_and_swap_32_unaligned(&gpu_fetch,
                                       reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
  
@@ -11390,7 +11389,7 @@ index 1254710..ac11ae2 100644
      REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
                    frontbuffer_virtual_address);
      return;
-@@ -487,11 +697,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -487,11 +690,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    assert_true(*width == 1 + gpu_fetch.size_2d.width);
    assert_true(*height == 1 + gpu_fetch.size_2d.height);
  
@@ -11402,7 +11401,7 @@ index 1254710..ac11ae2 100644
    buffer_ptr.Zero(64 * 4);
  
    uint32_t offset = 0;
-@@ -507,12 +712,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -507,12 +705,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    dwords[offset++] = gpu_fetch.dword_4;
    dwords[offset++] = gpu_fetch.dword_5;
  
@@ -11417,7 +11416,7 @@ index 1254710..ac11ae2 100644
  
    // Fill the rest of the buffer with NOP packets.
    for (uint32_t i = offset; i < 64; i++) {
-@@ -582,3 +788,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
+@@ -582,3 +781,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
  REX_EXPORT(__imp__VdRetrainEDRAMWorker, rex::kernel::xboxkrnl::VdRetrainEDRAMWorker_entry)
  REX_EXPORT(__imp__VdRetrainEDRAM, rex::kernel::xboxkrnl::VdRetrainEDRAM_entry)
  REX_EXPORT(__imp__VdSwap, rex::kernel::xboxkrnl::VdSwap_entry)
@@ -13835,7 +13834,7 @@ index 43d6c06..ff5b2d9 100644
        auto stats = stats_provider_();
        if (stats.frame_count > 0) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..fc089c0 100644
+index 7360ed9..b129da4 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,15 +12,29 @@
@@ -14056,7 +14055,7 @@ index 7360ed9..fc089c0 100644
  }
  
  void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnectionState new_state) {
-@@ -1494,10 +1575,172 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
+@@ -1494,10 +1575,184 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
  #endif  // XE_PLATFORM
  }
  
@@ -14178,6 +14177,18 @@ index 7360ed9..fc089c0 100644
 +    }
 +    last_presented_guest_swap_ = cur_swaps;
 +    last_host_present_time_ = now;
++  } else if (guest_active && target_fps == 40) {
++    // Decoupled 40 Hz present: guest VdSwap stays at 60.0 Hz (1.00x); host skips intermediate
++    // frames until 25.0 ms has elapsed since the last actual SwapChain->Present().
++    s_new_guest_frame_ready.store(false, std::memory_order_relaxed);
++    const auto now = std::chrono::steady_clock::now();
++    const double elapsed_ms =
++        std::chrono::duration<double, std::milli>(now - last_host_present_time_).count();
++    if (!execute_ui_drawers && elapsed_ms < 24.5) {
++      return PaintResult::kPresented;
++    }
++    last_presented_guest_swap_ = guest_vdswap_count();
++    last_host_present_time_ = now;
 +  } else if (guest_active && target_fps > 0 && target_fps <= 60 && target_fps != 40) {
 +    const auto now = std::chrono::steady_clock::now();
 +    bool is_new_frame = s_new_guest_frame_ready.exchange(false, std::memory_order_acq_rel);
@@ -14229,7 +14240,7 @@ index 7360ed9..fc089c0 100644
    switch (result) {
      case PaintResult::kPresented:
        surface_paint_connection_was_optimal_at_successful_paint_ = true;
-@@ -1663,5 +1906,361 @@ void Presenter::DXGIUITickThread() {
+@@ -1663,5 +1918,361 @@ void Presenter::DXGIUITickThread() {
  }
  #endif  // XE_PLATFORM
  

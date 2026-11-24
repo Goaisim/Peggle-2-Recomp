@@ -232,5 +232,29 @@ else()
 
     if(WIN32)
         target_link_options(peggle2 PRIVATE "LINKER:/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+        set(_peggle2_runtime_tgt "")
+        if(TARGET rex::runtime)
+            set(_peggle2_runtime_tgt rex::runtime)
+        elseif(TARGET rexruntime)
+            set(_peggle2_runtime_tgt rexruntime)
+        endif()
+        set(_peggle2_xenos_tgt "")
+        if(TARGET rex::gpu-xenos)
+            set(_peggle2_xenos_tgt rex::gpu-xenos)
+        elseif(TARGET rexgpu-xenos)
+            set(_peggle2_xenos_tgt rexgpu-xenos)
+        endif()
+        if(_peggle2_runtime_tgt)
+            add_custom_command(TARGET peggle2 POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${_peggle2_runtime_tgt}>" "$<TARGET_FILE_DIR:peggle2>/$<TARGET_FILE_NAME:${_peggle2_runtime_tgt}>"
+                VERBATIM
+            )
+        endif()
+        if(_peggle2_xenos_tgt)
+            add_custom_command(TARGET peggle2 POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${_peggle2_xenos_tgt}>" "$<TARGET_FILE_DIR:peggle2>/$<TARGET_FILE_NAME:${_peggle2_xenos_tgt}>"
+                VERBATIM
+            )
+        endif()
     endif()
 endif()

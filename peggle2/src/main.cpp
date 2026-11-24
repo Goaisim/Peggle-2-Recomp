@@ -2371,6 +2371,31 @@ extern "C" REX_FUNC(sub_8261FE50) {
   rex::SetGuestThreadState(1);
   rex::RecordGuestTick();
   __imp__sub_8261FE50(ctx, base);
+
+  // Fail-safe monotonic 60.0 Hz guest swap ceiling in case an underlying swap returns early.
+  {
+    constexpr auto kMinSwapInterval = std::chrono::nanoseconds(16666667);
+    static bool s_swap_guard_init = false;
+    static std::chrono::steady_clock::time_point s_next_swap_guard{};
+    auto post_now = std::chrono::steady_clock::now();
+    if (!s_swap_guard_init || s_next_swap_guard > post_now + kMinSwapInterval) {
+      s_next_swap_guard = post_now + kMinSwapInterval;
+      s_swap_guard_init = true;
+    } else if (post_now > s_next_swap_guard + std::chrono::milliseconds(4)) {
+      s_next_swap_guard = post_now + kMinSwapInterval;
+    } else {
+      while (post_now < s_next_swap_guard) {
+        auto rem = std::chrono::duration_cast<std::chrono::nanoseconds>(s_next_swap_guard - post_now).count();
+        if (rem > 2200000LL) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+          std::this_thread::yield();
+        }
+        post_now = std::chrono::steady_clock::now();
+      }
+      s_next_swap_guard += kMinSwapInterval;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3174,7 +3199,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
       };
 
       if (hud_mode == kHudVisible) {
-        ImGui::Text("[ReXGlue Telemetry]");
+        ImGui::Text("[ReXGlue Telemetry | RT=%s]", rex::GetRuntimeBuildTag());
         ImGui::Text("BootStage: %d:%s (0:Init|1:ArenaOK|2:XexOK|3:VFS(%u files)|4:ThreadRun|5:VdSwap) Base=0x%llX%s%s",
                     boot_tel.boot_stage, boot_stage_name, boot_tel.bundle_assets,
                     static_cast<unsigned long long>(boot_tel.guest_base),
@@ -3216,7 +3241,11 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     g_telemetry_host_p99_ms.load(std::memory_order_relaxed),
                     g_telemetry_host_max_ms.load(std::memory_order_relaxed));
         ImGui::Text("Rendered FPS:   %.1f (%.2f ms)", ren_fps, ren_ms);
+        const bool guest_ok = (sim_fps >= 57.0f && sim_fps <= 63.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              guest_ok ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.9f, 0.2f, 1.0f));
         ImGui::Text("Guest Logic:    %.1f FPS (%.2fx speed)", sim_fps, speed);
+        ImGui::PopStyleColor();
         ImGui::Text("Render Res:     %ux%u (%.2fx)", ren_w, ren_h, ren_scale);
         ImGui::Text("VSync:          %s", vsync_idx == kVSyncOff ? "Off (Host Pacer)" : "On (Swapchain)");
         ImGui::Text("FPS Limiter:    %s", is_uncapped ? "Uncapped Present" : "Match Target Hz");
@@ -3252,11 +3281,9 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         const char* rec_tag = g_rec_active.load(std::memory_order_relaxed) ? " [REC]" :
                               (g_play_active.load(std::memory_order_relaxed) ? " [PLAY]" : "");
         const char* min_cpu_state = rex::GetGuestThreadStateName(boot_tel.guest_state);
-        ImGui::Text("BootStage: %d:%s (VFS=%u) Base=0x%llX%s%s | GuestCPU: Ticks=%llu PC=0x%08X LR=0x%08X %s%s VBlanks=%llu",
+        ImGui::Text("BootStage: %d:%s (VFS=%u) RT=%s | GuestCPU: Ticks=%llu PC=0x%08X LR=0x%08X %s%s VBlanks=%llu",
                     boot_tel.boot_stage, boot_stage_name, boot_tel.bundle_assets,
-                    static_cast<unsigned long long>(boot_tel.guest_base),
-                    boot_tel.boot_error[0] ? " Err=" : "",
-                    boot_tel.boot_error[0] ? boot_tel.boot_error : "",
+                    rex::GetRuntimeBuildTag(),
                     static_cast<unsigned long long>(boot_tel.guest_ticks),
                     boot_tel.guest_pc,
                     boot_tel.guest_lr,
@@ -3961,10 +3988,11 @@ static std::thread g_cadence_reporter([] {
     last_host_count = cur_host;
 
     uint32_t f2 = g_f2c8_updates.exchange(0);
-    g_vdswap_calls.store(0, std::memory_order_relaxed);
+    uint32_t vds = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
+    uint32_t guest_fps_val = (vds > 0) ? vds : f2;
     g_telemetry_rendered_fps.store((float)ren, std::memory_order_relaxed);
     g_telemetry_host_fps.store((float)host, std::memory_order_relaxed);
-    g_telemetry_sim_fps.store((float)f2, std::memory_order_relaxed);
+    g_telemetry_sim_fps.store((float)guest_fps_val, std::memory_order_relaxed);
 
     FrameTimeSummary gft = g_guest_ft_window.Consume();
     FrameTimeSummary hft = g_host_ft_window.Consume();
@@ -3980,12 +4008,12 @@ static std::thread g_cadence_reporter([] {
     rex::ui::ProfilingHudMetrics pm{};
     const bool has_pm = rex::ui::Presenter::GetActiveProfilingHudMetrics(pm);
     int fps_idx = g_target_fps_index.load(std::memory_order_relaxed);
-    float speed = (f2 > 0) ? ((float)f2 / 60.0f) : 1.00f;
-    printf("[Framerate Mode: %s] CADENCE 1s: Host Present=%u, Rendered FPS=%u, Sim Updates=%u (%.2fx speed) | "
+    float speed = (guest_fps_val > 0) ? ((float)guest_fps_val / 60.0f) : 1.00f;
+    printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Host Present=%u, Rendered FPS=%u, VdSwaps=%u, Sim=%u (%.2fx speed) | "
            "HostFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u >33ms=%u) | "
            "GuestFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u) | "
            "Perf(cpu=%.2f pres=%.2f)\n",
-           kFpsPresets[fps_idx].name, host, ren, f2, speed,
+           kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(), host, ren, vds, f2, speed,
            hft.p50, hft.p95, hft.p99, hft.max, hft.over20, hft.over33,
            gft.p50, gft.p95, gft.p99, gft.max, gft.over20,
            has_pm ? pm.avg_cpu_ms : -1.0f, has_pm ? pm.avg_present_ms : -1.0f);
