@@ -494,7 +494,7 @@ index c19caea..6b94cf4 100644
  #if REX_ARCH_AMD64
  // Raw clock source requires platform-specific implementation
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index da8e432..37140b2 100644
+index da8e432..4507adf 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -12,6 +12,7 @@
@@ -556,7 +556,7 @@ index da8e432..37140b2 100644
  
    // "Desired" is for the external thread managing the post-processing effect.
    SwapPostEffect GetDesiredSwapPostEffect() const { return swap_post_effect_desired_; }
-@@ -230,6 +261,22 @@ class CommandProcessor {
+@@ -230,20 +261,52 @@ class CommandProcessor {
    // Shared memexport readback enable state with backend legacy-flag override support.
    bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
  
@@ -579,7 +579,20 @@ index da8e432..37140b2 100644
    memory::Memory* memory_ = nullptr;
    system::KernelState* kernel_state_ = nullptr;
    GraphicsSystem* graphics_system_ = nullptr;
-@@ -244,6 +291,16 @@ class CommandProcessor {
+   RegisterFile* register_file_ = nullptr;
+ 
++  bool HasPendingFns() const {
++    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
++    return !pending_fns_.empty();
++  }
++
+   std::atomic<bool> worker_running_;
+   system::object_ref<system::XHostThread> worker_thread_;
+ 
++  mutable std::mutex pending_fns_mutex_;
+   std::queue<std::function<void()>> pending_fns_;
+ 
+   // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
  
    uint32_t counter_ = 0;
@@ -596,7 +609,7 @@ index da8e432..37140b2 100644
  
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
-@@ -276,6 +333,12 @@ class CommandProcessor {
+@@ -276,6 +339,12 @@ class CommandProcessor {
    // Set by backend command processors to their legacy memexport readback cvar
    // name (for explicit-override compatibility).
    const char* legacy_readback_memexport_cvar_name_ = nullptr;
@@ -610,7 +623,7 @@ index da8e432..37140b2 100644
   private:
    reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index 96d362b..3fb71b7 100644
+index 96d362b..a94955c 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
 @@ -52,6 +52,7 @@ class D3D12CommandProcessor : public CommandProcessor {
@@ -651,7 +664,15 @@ index 96d362b..3fb71b7 100644
    bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                        ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
    bool IssueCopy_ReadbackResolvePath();
-@@ -542,6 +559,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -421,6 +438,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+   bool device_removed_ = false;
+ 
+   bool cache_clear_requested_ = false;
++  std::atomic<bool> reinitialize_backend_requested_{false};
+ 
+   HANDLE fence_completion_event_ = nullptr;
+ 
+@@ -542,6 +560,7 @@ class D3D12CommandProcessor : public CommandProcessor {
    std::unordered_map<uint32_t, uint32_t> texture_cache_bindless_sampler_map_;
  
    // Root signatures for different descriptor counts.
@@ -659,7 +680,7 @@ index 96d362b..3fb71b7 100644
    std::unordered_map<uint32_t, ID3D12RootSignature*> root_signatures_bindful_;
    ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
    ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
-@@ -641,6 +659,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -641,6 +660,7 @@ class D3D12CommandProcessor : public CommandProcessor {
    ID3D12Resource* scratch_buffer_ = nullptr;
    uint32_t scratch_buffer_size_ = 0;
    D3D12_RESOURCE_STATES scratch_buffer_state_;
@@ -667,7 +688,7 @@ index 96d362b..3fb71b7 100644
    bool scratch_buffer_used_ = false;
  
    ID3D12Resource* readback_buffer_ = nullptr;
-@@ -648,6 +667,21 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -648,6 +668,21 @@ class D3D12CommandProcessor : public CommandProcessor {
    std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
    std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
  
@@ -689,7 +710,7 @@ index 96d362b..3fb71b7 100644
    static constexpr uint32_t kMaxOcclusionQueries = 8192;
    Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
    Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
-@@ -760,6 +794,22 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -760,6 +795,22 @@ class D3D12CommandProcessor : public CommandProcessor {
  
    // Temporary storage for memexport stream constants used in the draw.
    std::vector<draw_util::MemExportRange> memexport_ranges_;
@@ -4544,7 +4565,7 @@ index ef5bdf4..67b7d09 100644
        info.total_size = 0;
      } else {
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 1645848..3da7d8a 100644
+index 1645848..cbd8215 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
 @@ -10,8 +10,13 @@
@@ -4596,7 +4617,7 @@ index 1645848..3da7d8a 100644
  }
  
  void InitLogging(const char* log_file, spdlog::level::level_enum level) {
-@@ -561,4 +573,828 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
+@@ -561,4 +573,837 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
    return result;
  }
  
@@ -5400,6 +5421,7 @@ index 1645848..3da7d8a 100644
 +static std::condition_variable g_app_bg_cv;
 +
 +void SetAppBackgroundPaused(bool paused) {
++#if REX_PLATFORM_IOS
 +  {
 +    std::lock_guard<std::mutex> lock(g_app_bg_mutex);
 +    const bool prev = g_app_bg_paused.exchange(paused, std::memory_order_release);
@@ -5408,6 +5430,14 @@ index 1645848..3da7d8a 100644
 +    }
 +  }
 +  g_app_bg_cv.notify_all();
++#else
++  (void)paused;
++  if (g_app_bg_paused.load(std::memory_order_acquire)) {
++    std::lock_guard<std::mutex> lock(g_app_bg_mutex);
++    g_app_bg_paused.store(false, std::memory_order_release);
++    g_app_bg_cv.notify_all();
++  }
++#endif
 +}
 +
 +bool IsAppBackgroundPaused() {
@@ -6682,7 +6712,7 @@ index 0d8f8af..25ca632 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..290f2b0 100644
+index a744375..0eb241c 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,11 +10,16 @@
@@ -6731,7 +6761,7 @@ index a744375..290f2b0 100644
  using namespace rex::graphics::xenos;
  
  namespace {
-@@ -143,6 +156,10 @@ bool CommandProcessor::Initialize() {
+@@ -143,25 +156,44 @@ bool CommandProcessor::Initialize() {
        }));
    worker_thread_->set_name("GPU Commands");
    worker_thread_->Create();
@@ -6742,7 +6772,13 @@ index a744375..290f2b0 100644
  
    return true;
  }
-@@ -155,7 +172,12 @@ void CommandProcessor::Shutdown() {
+ 
+ void CommandProcessor::Shutdown() {
+   worker_running_ = false;
++  rex::SetAppBackgroundPaused(false);
+   write_ptr_index_event_->Set();
+   worker_thread_->Wait(0, 0, 0, nullptr);
+   worker_thread_.reset();
  }
  
  void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -6755,8 +6791,26 @@ index a744375..290f2b0 100644
 +}
  
  void CommandProcessor::CallInThread(std::function<void()> fn) {
-   if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
-@@ -198,12 +220,21 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
++  bool run_inline = false;
++  {
++    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
++    if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
++      run_inline = true;
++    } else {
++      pending_fns_.push(std::move(fn));
++    }
++  }
++  if (run_inline) {
+     fn();
+-  } else {
+-    pending_fns_.push(std::move(fn));
++  } else if (write_ptr_index_event_) {
++    write_ptr_index_event_->Set();
+   }
+ }
+ 
+@@ -198,15 +230,31 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
  }
  
  void CommandProcessor::WorkerThreadMain() {
@@ -6769,16 +6823,29 @@ index a744375..290f2b0 100644
    }
  
    while (worker_running_) {
+-    while (!pending_fns_.empty()) {
+-      auto fn = std::move(pending_fns_.front());
+-      pending_fns_.pop();
 +    if (rex::IsAppBackgroundPaused()) {
 +      PrepareForWait();
 +      rex::WaitWhileAppBackgroundPaused();
 +      continue;
 +    }
 +
-     while (!pending_fns_.empty()) {
-       auto fn = std::move(pending_fns_.front());
-       pending_fns_.pop();
-@@ -214,16 +245,30 @@ void CommandProcessor::WorkerThreadMain() {
++    for (;;) {
++      std::function<void()> fn;
++      {
++        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
++        if (pending_fns_.empty()) {
++          break;
++        }
++        fn = std::move(pending_fns_.front());
++        pending_fns_.pop();
++      }
+       fn();
+     }
+ 
+@@ -214,32 +262,51 @@ void CommandProcessor::WorkerThreadMain() {
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
        // We've run out of commands to execute.
@@ -6794,7 +6861,7 @@ index a744375..290f2b0 100644
 +        rex::thread::Wait(write_ptr_index_event_.get(), true,
 +                          std::chrono::milliseconds(5));
 +        write_ptr_index = write_ptr_index_.load();
-+      } while (worker_running_ && pending_fns_.empty() &&
++      } while (worker_running_ && !HasPendingFns() &&
 +               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
 +#else
        uint32_t loop_count = 0;
@@ -6812,14 +6879,15 @@ index a744375..290f2b0 100644
          }
  
          rex::thread::MaybeYield();
-@@ -231,15 +276,20 @@ void CommandProcessor::WorkerThreadMain() {
+         loop_count++;
          write_ptr_index = write_ptr_index_.load();
-       } while (worker_running_ && pending_fns_.empty() &&
+-      } while (worker_running_ && pending_fns_.empty() &&
++      } while (worker_running_ && !HasPendingFns() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
 +#endif
        ReturnFromWait();
 -      if (!worker_running_ || !pending_fns_.empty()) {
-+      if (!worker_running_ || !pending_fns_.empty() || rex::IsAppBackgroundPaused()) {
++      if (!worker_running_ || HasPendingFns() || rex::IsAppBackgroundPaused()) {
          continue;
        }
      }
@@ -6834,7 +6902,7 @@ index a744375..290f2b0 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -363,6 +413,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -363,6 +430,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
    if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
      uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
      if ((1 << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
@@ -6844,7 +6912,7 @@ index a744375..290f2b0 100644
        // Enabled - write to address.
        uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
        uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-@@ -668,6 +721,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+@@ -668,6 +738,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
    if (packet == 0) {
      return true;
    }
@@ -6852,7 +6920,7 @@ index a744375..290f2b0 100644
  
    if (packet == 0xCDCDCDCD) {
      REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
-@@ -763,11 +817,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -763,11 +834,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      case PM4_INTERRUPT:
        result = ExecutePacketType3_INTERRUPT(reader, packet, count);
        break;
@@ -6867,7 +6935,7 @@ index a744375..290f2b0 100644
        result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
        break;
      case PM4_WAIT_REG_MEM:
-@@ -797,19 +851,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -797,19 +868,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      case PM4_EVENT_WRITE_ZPD:
        result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
        break;
@@ -6892,7 +6960,7 @@ index a744375..290f2b0 100644
        result = ExecutePacketType3_LOAD_ALU_CONSTANT(reader, packet, count);
        break;
      case PM4_SET_SHADER_CONSTANTS:
-@@ -914,6 +968,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
+@@ -914,6 +985,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
                                                      uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -6903,7 +6971,7 @@ index a744375..290f2b0 100644
    // generate interrupt from the command stream
    uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
    for (int n = 0; n < 6; n++) {
-@@ -956,9 +1014,49 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -956,9 +1031,49 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
    uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
    uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
@@ -6954,7 +7022,7 @@ index a744375..290f2b0 100644
  
    ++counter_;
    return true;
-@@ -989,10 +1087,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -989,10 +1104,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
  
    bool is_memory = (wait_info & 0x10) != 0;
  
@@ -6975,7 +7043,7 @@ index a744375..290f2b0 100644
        value =
            *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
        value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
-@@ -1030,24 +1138,72 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1030,24 +1155,72 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
@@ -7052,7 +7120,7 @@ index a744375..290f2b0 100644
        }
      }
    } while (!matched);
-@@ -1094,6 +1250,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1094,6 +1267,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
    auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
    mem_addr &= ~0x3;
    reg_val = GpuSwap(reg_val, endianness);
@@ -7061,7 +7129,7 @@ index a744375..290f2b0 100644
    memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
  
    return true;
-@@ -1101,6 +1259,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1101,6 +1276,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
  
  bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
@@ -7070,7 +7138,7 @@ index a744375..290f2b0 100644
    uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
    for (uint32_t i = 0; i < count - 1; i++) {
      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
-@@ -1214,6 +1374,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1214,6 +1391,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
    data_value = GpuSwap(data_value, endianness);
@@ -7079,7 +7147,7 @@ index a744375..290f2b0 100644
    memory::store(memory_->TranslatePhysical(address), data_value);
    return true;
  }
-@@ -1241,6 +1403,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
+@@ -1241,6 +1420,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
        1,                                         // max z
    };
    assert_true(endianness == xenos::Endian::k8in16);
@@ -7088,7 +7156,7 @@ index a744375..290f2b0 100644
    memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                       rex::countof(extents));
    return true;
-@@ -1292,6 +1456,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+@@ -1292,6 +1473,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
    // uint32_t viz_use = viz_query_condition & 0x100;
  
    assert_not_zero(count_remaining);
@@ -7096,7 +7164,7 @@ index a744375..290f2b0 100644
    if (!count_remaining) {
      REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
      return false;
-@@ -1368,6 +1533,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+@@ -1368,6 +1550,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
    // we don't support yet.
    reader->AdvanceRead(count_remaining * sizeof(uint32_t));
  
@@ -7111,7 +7179,7 @@ index a744375..290f2b0 100644
      auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
      if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..a7fb52e 100644
+index 19874a5..f34c922 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -31,6 +31,7 @@
@@ -7165,7 +7233,7 @@ index 19874a5..a7fb52e 100644
    cache_clear_requested_ = true;
  }
  
-@@ -112,11 +142,31 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
+@@ -112,11 +142,39 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
    if (shared_memory_) {
      shared_memory_->InvalidateAllPages();
    }
@@ -7173,9 +7241,17 @@ index 19874a5..a7fb52e 100644
 +}
 +
 +bool D3D12CommandProcessor::ReinitializeBackendContext() {
++  if (frame_open_) {
++    // Defer backend recreation cleanly to the next completed swap boundary so
++    // RTV/ROV render target caches and descriptor heaps never reset mid-frame.
++    reinitialize_backend_requested_.store(true, std::memory_order_release);
++    return true;
++  }
++  reinitialize_backend_requested_.store(false, std::memory_order_release);
 +  if (submission_open_) {
 +    EndSubmission(false);
 +  }
++  frame_open_ = false;
 +  ShutdownContext();
 +  if (!SetupContext()) {
 +    return false;
@@ -7197,7 +7273,7 @@ index 19874a5..a7fb52e 100644
    for (VertexBufferState& state : vertex_buffer_states_) {
      state.address = UINT32_MAX;
      state.size = UINT32_MAX;
-@@ -152,7 +202,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+@@ -152,7 +210,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
  
  bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                 uint32_t packet, uint32_t count) {
@@ -7207,7 +7283,7 @@ index 19874a5..a7fb52e 100644
      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
    }
  
-@@ -297,6 +348,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
+@@ -297,6 +356,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
    assert_true(index_offset <= 32);
  
    // Try an existing root signature.
@@ -7215,7 +7291,7 @@ index 19874a5..a7fb52e 100644
    auto it = root_signatures_bindful_.find(index);
    if (it != root_signatures_bindful_.end()) {
      return it->second;
-@@ -725,6 +777,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
+@@ -725,6 +785,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
    if (size <= scratch_buffer_size_) {
      PushTransitionBarrier(scratch_buffer_, scratch_buffer_state_, state);
      scratch_buffer_state_ = state;
@@ -7223,7 +7299,7 @@ index 19874a5..a7fb52e 100644
      scratch_buffer_used_ = true;
      return scratch_buffer_;
    }
-@@ -749,6 +802,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
+@@ -749,6 +810,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
    scratch_buffer_ = buffer;
    scratch_buffer_size_ = size;
    scratch_buffer_state_ = state;
@@ -7231,7 +7307,7 @@ index 19874a5..a7fb52e 100644
    scratch_buffer_used_ = true;
    return scratch_buffer_;
  }
-@@ -764,6 +818,7 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
+@@ -764,6 +826,7 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
  }
  
  void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
@@ -7239,7 +7315,7 @@ index 19874a5..a7fb52e 100644
    if (current_external_pipeline_ != pipeline) {
      current_external_pipeline_ = pipeline;
      current_guest_pipeline_ = nullptr;
-@@ -772,6 +827,7 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
+@@ -772,6 +835,7 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
  }
  
  void D3D12CommandProcessor::SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature) {
@@ -7247,7 +7323,7 @@ index 19874a5..a7fb52e 100644
    if (current_graphics_root_signature_ != root_signature) {
      current_graphics_root_signature_ = root_signature;
      deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
-@@ -940,6 +996,8 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -940,6 +1004,8 @@ bool D3D12CommandProcessor::SetupContext() {
      REXGPU_ERROR("Failed to initialize the render target cache");
      return false;
    }
@@ -7256,7 +7332,7 @@ index 19874a5..a7fb52e 100644
  
    // Initialize resource binding.
    constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
-@@ -1619,6 +1677,7 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -1619,6 +1685,7 @@ bool D3D12CommandProcessor::SetupContext() {
    }
  
    occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
@@ -7264,7 +7340,7 @@ index 19874a5..a7fb52e 100644
  
    // Just not to expose uninitialized memory.
    std::memset(&system_constants_, 0, sizeof(system_constants_));
-@@ -1627,9 +1686,11 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -1627,9 +1694,11 @@ bool D3D12CommandProcessor::SetupContext() {
  }
  
  void D3D12CommandProcessor::ShutdownContext() {
@@ -7276,7 +7352,7 @@ index 19874a5..a7fb52e 100644
  
    ui::d3d12::util::ReleaseAndNull(readback_buffer_);
    readback_buffer_size_ = 0;
-@@ -1768,8 +1829,34 @@ void D3D12CommandProcessor::ShutdownContext() {
+@@ -1768,8 +1837,34 @@ void D3D12CommandProcessor::ShutdownContext() {
    CommandProcessor::ShutdownContext();
  }
  
@@ -7311,7 +7387,7 @@ index 19874a5..a7fb52e 100644
  
    if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
      if (frame_open_) {
-@@ -1877,9 +1964,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+@@ -1877,9 +1972,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
        texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
      }
      InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
@@ -7328,7 +7404,7 @@ index 19874a5..a7fb52e 100644
    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
  }
  
-@@ -1894,8 +1988,23 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -1894,8 +1996,26 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
  void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
@@ -7347,12 +7423,25 @@ index 19874a5..a7fb52e 100644
 +    // Skipped frame: safely poll completed GPU fences and close any open command list
 +    CheckSubmissionFence(0);
 +    EndSubmission(true);
++    if (reinitialize_backend_requested_.exchange(false, std::memory_order_acq_rel)) {
++      ReinitializeBackendContext();
++    }
 +    return;
 +  }
  
    if (!graphics_system_)
      return;
-@@ -2271,6 +2380,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+@@ -2254,6 +2374,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
++  if (reinitialize_backend_requested_.exchange(false, std::memory_order_acq_rel)) {
++    ReinitializeBackendContext();
++  }
+ }
+ 
+ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+@@ -2271,6 +2394,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
  bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -7362,7 +7451,7 @@ index 19874a5..a7fb52e 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -2341,6 +2453,84 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2341,6 +2467,84 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
      return true;
    }
  
@@ -7447,7 +7536,7 @@ index 19874a5..a7fb52e 100644
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
    // Shader modifications.
-@@ -2462,6 +2652,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2462,6 +2666,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    // Update viewport, scissor, blend factor and stencil reference.
    UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
  
@@ -7465,7 +7554,7 @@ index 19874a5..a7fb52e 100644
    // Update system constants before uploading them.
    // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
    UpdateSystemConstantValues(memexport_used, primitive_polygonal,
-@@ -2476,6 +2677,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2476,6 +2691,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    // Must not call anything that can change the descriptor heap from now on!
  
    // Ensure vertex buffers are resident.
@@ -7474,7 +7563,7 @@ index 19874a5..a7fb52e 100644
    const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
      uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
-@@ -2484,43 +2687,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2484,43 +2701,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        vfetch_bits_remaining &= ~(uint32_t(1) << j);
        uint32_t vfetch_index = i * 32 + j;
        uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
@@ -7541,7 +7630,7 @@ index 19874a5..a7fb52e 100644
      }
    }
  
-@@ -2553,6 +2748,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2553,6 +2762,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
      }
    }
  
@@ -7567,7 +7656,7 @@ index 19874a5..a7fb52e 100644
    // Primitive topology.
    D3D_PRIMITIVE_TOPOLOGY primitive_topology;
    if (primitive_processing_result.IsTessellated()) {
-@@ -2855,6 +3069,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+@@ -2855,6 +3083,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
                               readback.submission_written[read_index] &&
                               readback.submission_written[read_index] <= submission_completed_;
    if (!previous_slot_ready) {
@@ -7578,7 +7667,7 @@ index 19874a5..a7fb52e 100644
      IssueDraw_MemexportReadbackFullPath(total_size);
      readback.current_index = read_index;
      return true;
-@@ -2871,6 +3089,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+@@ -2871,6 +3103,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
  }
  
  bool D3D12CommandProcessor::IssueCopy() {
@@ -7589,7 +7678,7 @@ index 19874a5..a7fb52e 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -2878,12 +3100,18 @@ bool D3D12CommandProcessor::IssueCopy() {
+@@ -2878,12 +3114,18 @@ bool D3D12CommandProcessor::IssueCopy() {
      return false;
    }
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
@@ -7611,7 +7700,7 @@ index 19874a5..a7fb52e 100644
  }
  
  bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -2926,7 +3154,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -2926,7 +3168,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
          rb.buffers[write_index]->Unmap(0, nullptr);
          rb.mapped_data[write_index] = nullptr;
        }
@@ -7625,7 +7714,7 @@ index 19874a5..a7fb52e 100644
      }
      rb.buffers[write_index] = buffer;
      rb.sizes[write_index] = size;
-@@ -3069,9 +3302,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3069,9 +3316,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                 written_address, written_length);
    }
  
@@ -7640,7 +7729,7 @@ index 19874a5..a7fb52e 100644
    uint32_t read_index = write_index;
    if (use_delayed_sync) {
      read_index = 1 - write_index;
-@@ -3083,13 +3320,24 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3083,13 +3334,24 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
    if (use_delayed_sync && (!rb.buffers[read_index] || written_length > rb.sizes[read_index] ||
                             !rb.mapped_data[read_index])) {
      is_cache_miss = true;
@@ -7668,7 +7757,7 @@ index 19874a5..a7fb52e 100644
    if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
        rb.mapped_data[read_index]) {
      uint8_t* destination = memory_->TranslatePhysical(written_address);
-@@ -3185,6 +3433,16 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3185,6 +3447,16 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
      resources_for_deletion_.pop_front();
    }
  
@@ -7685,7 +7774,7 @@ index 19874a5..a7fb52e 100644
    shared_memory_->CompletedSubmissionUpdated();
  
    render_target_cache_->CompletedSubmissionUpdated();
-@@ -3192,6 +3450,24 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3192,6 +3464,24 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
    primitive_processor_->CompletedSubmissionUpdated();
  
    texture_cache_->CompletedSubmissionUpdated(submission_completed_);
@@ -7710,7 +7799,7 @@ index 19874a5..a7fb52e 100644
  }
  
  void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
-@@ -3297,6 +3573,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3297,6 +3587,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
  
    if (!submission_open_) {
      submission_open_ = true;
@@ -7718,7 +7807,7 @@ index 19874a5..a7fb52e 100644
  
      // Start a new deferred command list - will submit it to the real one in the
      // end of the submission (when async pipeline creation requests are
-@@ -3331,6 +3608,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3331,6 +3622,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
  
    if (is_opening_frame) {
      frame_open_ = true;
@@ -7732,7 +7821,7 @@ index 19874a5..a7fb52e 100644
  
      // Reset bindings that depend on the data stored in the pools.
      std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
-@@ -3402,6 +3686,19 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3402,6 +3700,19 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    if (submission_open_) {
      assert_false(scratch_buffer_used_);
  
@@ -7752,7 +7841,7 @@ index 19874a5..a7fb52e 100644
      if (active_occlusion_query_.valid && occlusion_query_heap_) {
        deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                           active_occlusion_query_.host_index);
-@@ -3443,8 +3740,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3443,8 +3754,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
      }
  
      direct_queue->Signal(submission_fence_, submission_current_++);
@@ -7765,7 +7854,7 @@ index 19874a5..a7fb52e 100644
  
      // Queue operations done directly (like UpdateTileMappings) will be awaited
      // alongside the last submission if needed.
-@@ -3459,6 +3760,33 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3459,6 +3774,33 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
      // Submission already closed now, so minus 1.
      closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
  
@@ -7799,7 +7888,7 @@ index 19874a5..a7fb52e 100644
      if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
        cache_clear_requested_ = false;
  
-@@ -4003,93 +4331,27 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+@@ -4003,93 +4345,27 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
    cbuffer_binding_system_.up_to_date &= !dirty;
  }
  
@@ -7854,7 +7943,16 @@ index 19874a5..a7fb52e 100644
 -  uint32_t root_parameter_shared_memory_and_bindful_edram =
 -      bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
 -                               : kRootParameter_Bindful_SharedMemoryAndEdram;
--
++  const uint32_t root_parameter_float_constants_pixel =
++      bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsPixel
++                               : kRootParameter_Bindful_FloatConstantsPixel;
++  const uint32_t root_parameter_system_constants =
++      bindless_resources_used_ ? kRootParameter_Bindless_SystemConstants
++                               : kRootParameter_Bindful_SystemConstants;
++  const uint32_t root_parameter_bool_loop_constants =
++      bindless_resources_used_ ? kRootParameter_Bindless_BoolLoopConstants
++                               : kRootParameter_Bindful_BoolLoopConstants;
+ 
 -  //
 -  // Update root constant buffers that are common for bindful and bindless.
 -  //
@@ -7896,21 +7994,12 @@ index 19874a5..a7fb52e 100644
 -  } else {
 -    std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
 -  }
-+  const uint32_t root_parameter_float_constants_pixel =
-+      bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsPixel
-+                               : kRootParameter_Bindful_FloatConstantsPixel;
-+  const uint32_t root_parameter_system_constants =
-+      bindless_resources_used_ ? kRootParameter_Bindless_SystemConstants
-+                               : kRootParameter_Bindful_SystemConstants;
-+  const uint32_t root_parameter_bool_loop_constants =
-+      bindless_resources_used_ ? kRootParameter_Bindless_BoolLoopConstants
-+                               : kRootParameter_Bindful_BoolLoopConstants;
- 
+-
 -  // Write the constant buffer data.
    if (!cbuffer_binding_system_.up_to_date) {
      uint8_t* system_constants = constant_buffer_pool_->Request(
          frame_current_, sizeof(system_constants_), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-@@ -4102,10 +4364,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4102,10 +4378,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
      current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
    }
    if (!cbuffer_binding_float_vertex_.up_to_date) {
@@ -7923,7 +8012,7 @@ index 19874a5..a7fb52e 100644
      uint8_t* float_constants = constant_buffer_pool_->Request(
          frame_current_, sizeof(float) * 4 * std::max(float_constant_count_vertex, uint32_t(1)),
          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-@@ -4180,6 +4440,144 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4180,6 +4454,144 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
      cbuffer_binding_fetch_.up_to_date = true;
      current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
    }
@@ -8068,7 +8157,7 @@ index 19874a5..a7fb52e 100644
  
    //
    // Update descriptors.
-@@ -4639,31 +5037,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4639,31 +5051,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
    }
  
    // Update the root parameters.
@@ -8101,7 +8190,7 @@ index 19874a5..a7fb52e 100644
    if (!(current_graphics_root_up_to_date_ &
          (1u << root_parameter_shared_memory_and_bindful_edram))) {
      assert_true(current_shared_memory_binding_is_uav_.has_value());
-@@ -4866,6 +5240,62 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
+@@ -4866,6 +5254,62 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
    occlusion_query_heap_.Reset();
  }
  
@@ -13847,7 +13936,7 @@ index 43d6c06..ff5b2d9 100644
        auto stats = stats_provider_();
        if (stats.frame_count > 0) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..af1d490 100644
+index 7360ed9..f8165a7 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,15 +12,29 @@
@@ -14255,7 +14344,37 @@ index 7360ed9..af1d490 100644
    switch (result) {
      case PaintResult::kPresented:
        surface_paint_connection_was_optimal_at_successful_paint_ = true;
-@@ -1663,5 +1920,377 @@ void Presenter::DXGIUITickThread() {
+@@ -1600,7 +1857,11 @@ void Presenter::WaitForUITickFromUIThread() {
+           std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
+       return;
+     }
+-    dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
++    if (dxgi_ui_tick_signal_condition_.wait_for(
++            dxgi_ui_tick_lock, std::chrono::milliseconds(32)) == std::cv_status::timeout) {
++      dxgi_ui_tick_last_draw_ = dxgi_ui_tick_last_vblank_;
++      return;
++    }
+   }
+ #endif  // XE_PLATFORM
+ }
+@@ -1609,6 +1870,7 @@ void Presenter::ForceUIThreadPaintTick() {
+ #if REX_PLATFORM_WIN32
+   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+   dxgi_ui_tick_force_requested_ = true;
++  dxgi_ui_tick_signal_condition_.notify_all();
+ #endif  // XE_PLATFORM
+ }
+ 
+@@ -1648,7 +1910,7 @@ void Presenter::DXGIUITickThread() {
+     {
+       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
+       dxgi_ui_tick_lock.unlock();
+-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
++      wait_succeeded = dxgi_output ? SUCCEEDED(dxgi_output->WaitForVBlank()) : false;
+     }
+     dxgi_ui_tick_lock.lock();
+     if (wait_succeeded) {
+@@ -1663,5 +1925,377 @@ void Presenter::DXGIUITickThread() {
  }
  #endif  // XE_PLATFORM
  

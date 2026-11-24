@@ -288,7 +288,7 @@ static std::atomic<int> g_opt_edram_mode{kEdramAuto};  // Auto (RTV on iGPU) / R
 #endif
 
 static std::atomic<bool> g_menu_open{false};
-static int g_selected_menu_item = 0;
+static std::atomic<int> g_selected_menu_item{0};
 constexpr int kMenuItemCount = 15;
 
 // Corner touch strip (A / B / Start) + HUD toggle exclusion rect state shared with XInput hook.
@@ -491,6 +491,7 @@ static void ApplyEdramModeSetting(int mode, bool reinit_backend) {
   if (reinit_backend) {
     std::filesystem::path cfg = g_active_config_path;
     if (!cfg.empty()) {
+      std::lock_guard<std::mutex> lock(g_settings_io_mutex);
       UpdateTomlKeyLine(cfg, {"render_target_path_d3d12"},
                         std::string("render_target_path_d3d12 = \"") + val + "\"", false);
     }
@@ -598,7 +599,8 @@ static float PaceGuestHook60Hz() {
     std::lock_guard<std::mutex> lock(s_hook_pacer_mutex);
     const uint64_t bg_cnt = rex::GetAppBackgroundPauseCount();
     const int64_t now_ns = MonotonicGuestClockNs();
-    if (!s_initialized || bg_cnt != s_last_bg_pause_count) {
+    if (!s_initialized || bg_cnt != s_last_bg_pause_count ||
+        s_next_deadline_ns > now_ns + 100'000'000LL) {
       s_last_bg_pause_count = bg_cnt;
       s_next_deadline_ns = now_ns + kGuestHookIntervalNs;
       s_initialized = true;
@@ -2359,15 +2361,15 @@ extern "C" REX_FUNC(sub_8261FE50) {
   static bool prev_enter = false;
   static bool prev_esc = false;
 
-  if (poll_key_edge(VK_F1, prev_f1)) {
-    bool cur = g_menu_open.load(std::memory_order_relaxed);
-    g_menu_open.store(!cur, std::memory_order_relaxed);
-  }
-
   HWND fg_swap = GetForegroundWindow();
   DWORD fg_pid = 0;
   if (fg_swap) GetWindowThreadProcessId(fg_swap, &fg_pid);
   bool swap_game_active = (fg_pid == GetCurrentProcessId());
+
+  if (poll_key_edge(VK_F1, prev_f1) && swap_game_active) {
+    bool cur = g_menu_open.load(std::memory_order_relaxed);
+    g_menu_open.store(!cur, std::memory_order_relaxed);
+  }
 
   if (poll_key_edge(VK_F2, prev_f2) && swap_game_active) {
     int cur = g_opt_mouse_aim.load(std::memory_order_relaxed);
@@ -2395,15 +2397,23 @@ extern "C" REX_FUNC(sub_8261FE50) {
     }
   }
 
-  if (g_menu_open.load(std::memory_order_relaxed)) {
-    if (poll_key_edge(VK_ESCAPE, prev_esc)) {
+  const bool esc_edge = poll_key_edge(VK_ESCAPE, prev_esc);
+  const bool up_edge = poll_key_edge(VK_UP, prev_up);
+  const bool down_edge = poll_key_edge(VK_DOWN, prev_down);
+  const bool left_edge = poll_key_edge(VK_LEFT, prev_left);
+  const bool right_edge = poll_key_edge(VK_RIGHT, prev_right) || poll_key_edge(VK_RETURN, prev_enter);
+
+  if (g_menu_open.load(std::memory_order_relaxed) && swap_game_active) {
+    if (esc_edge) {
       g_menu_open.store(false, std::memory_order_relaxed);
     }
-    if (poll_key_edge(VK_UP, prev_up)) {
-      g_selected_menu_item = (g_selected_menu_item + kMenuItemCount - 1) % kMenuItemCount;
+    if (up_edge) {
+      int cur = g_selected_menu_item.load(std::memory_order_relaxed);
+      g_selected_menu_item.store((cur + kMenuItemCount - 1) % kMenuItemCount, std::memory_order_relaxed);
     }
-    if (poll_key_edge(VK_DOWN, prev_down)) {
-      g_selected_menu_item = (g_selected_menu_item + 1) % kMenuItemCount;
+    if (down_edge) {
+      int cur = g_selected_menu_item.load(std::memory_order_relaxed);
+      g_selected_menu_item.store((cur + 1) % kMenuItemCount, std::memory_order_relaxed);
     }
 
     auto cycle_val = [](std::atomic<int>& opt, int delta, int max_val) {
@@ -2412,22 +2422,20 @@ extern "C" REX_FUNC(sub_8261FE50) {
       opt.store(next, std::memory_order_relaxed);
     };
 
-    bool left = poll_key_edge(VK_LEFT, prev_left);
-    bool right = poll_key_edge(VK_RIGHT, prev_right) || poll_key_edge(VK_RETURN, prev_enter);
-
-    if (left || right) {
-      int dir = right ? 1 : -1;
-      if (g_selected_menu_item == 0) {
+    if (left_edge || right_edge) {
+      int dir = right_edge ? 1 : -1;
+      int sel = g_selected_menu_item.load(std::memory_order_relaxed);
+      if (sel == 0) {
         int cur = g_target_fps_index.load(std::memory_order_relaxed);
         g_target_fps_index.store(StepFpsPresetIndex(cur, dir), std::memory_order_relaxed);
         SaveUserSettings();
-      } else if (g_selected_menu_item >= 0 && g_selected_menu_item < kMenuItemCount) {
-        const auto& e = kSettingEntries[g_selected_menu_item];
+      } else if (sel >= 0 && sel < kMenuItemCount) {
+        const auto& e = kSettingEntries[sel];
         int cur = e.value->load(std::memory_order_relaxed);
         int next = (cur + dir + e.count) % e.count;
         e.value->store(next, std::memory_order_relaxed);
 #if !REX_PLATFORM_IOS
-        if (g_selected_menu_item == 14) {
+        if (sel == 14) {
           ApplyEdramModeSetting(next, true);
         }
 #endif
@@ -2599,6 +2607,8 @@ PEGGLE_WRAP_NET_FAIL(sub_822FC718, rc < 0)
 // Win32 Icon & "Locate Your ISO / Game Data" Helpers
 // ---------------------------------------------------------------------------
 #ifdef _WIN32
+static HANDLE g_app_big_icon = nullptr;
+static HANDLE g_app_sm_icon = nullptr;
 static HWND g_app_hwnd = nullptr;
 
 static HWND EnsureAppWindowIcon() {
@@ -2620,10 +2630,18 @@ static HWND EnsureAppWindowIcon() {
     g_app_hwnd = ctx.found;
     if (g_app_hwnd) {
       HINSTANCE hinst = GetModuleHandleW(nullptr);
-      HANDLE big_ico = LoadImageW(hinst, MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
-      HANDLE sm_ico  = LoadImageW(hinst, MAKEINTRESOURCEW(101), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
-      if (big_ico) SendMessageW(g_app_hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_ico));
-      if (sm_ico)  SendMessageW(g_app_hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(sm_ico));
+      if (!g_app_big_icon) {
+        g_app_big_icon = LoadImageW(hinst, MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                                    LR_DEFAULTCOLOR | LR_SHARED);
+      }
+      if (!g_app_sm_icon) {
+        g_app_sm_icon = LoadImageW(hinst, MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                   LR_DEFAULTCOLOR | LR_SHARED);
+      }
+      if (g_app_big_icon) SendMessageW(g_app_hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_app_big_icon));
+      if (g_app_sm_icon)  SendMessageW(g_app_hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_app_sm_icon));
     }
   }
   return g_app_hwnd;
@@ -3498,7 +3516,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
 
       auto draw_option = [](int index, const char* label, const char* value,
                              std::function<void(int)> on_change) {
-        bool is_selected = (g_selected_menu_item == index);
+        bool is_selected = (g_selected_menu_item.load(std::memory_order_relaxed) == index);
         if (is_selected) {
           ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 0.25f, 1.0f)); // Bright yellow
         }
@@ -3511,7 +3529,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         snprintf(btn_r, sizeof(btn_r), ">##opt%d", index);
 
         if (ImGui::Button(btn_l, ImVec2(24, 0))) {
-          g_selected_menu_item = index;
+          g_selected_menu_item.store(index, std::memory_order_relaxed);
           on_change(-1);
           SaveUserSettings();
         }
@@ -3519,7 +3537,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         ImGui::Text(" %-22s ", value);
         ImGui::SameLine();
         if (ImGui::Button(btn_r, ImVec2(24, 0))) {
-          g_selected_menu_item = index;
+          g_selected_menu_item.store(index, std::memory_order_relaxed);
           on_change(1);
           SaveUserSettings();
         }

@@ -1723,8 +1723,11 @@ bool rex_ios_is_low_power_075x_active() {
 - (void)applicationWillTerminate:(UIApplication*)application {
   (void)application;
   [[NSNotificationCenter defaultCenter] removeObserver:self];
-  [self pauseRuntime];
+  [self.viewController setRenderPaused:YES];
+  rex_ios_audio_set_paused(true);
   rex_ios_wait_for_metal_idle();
+  // Unpark workers and guest threads before InvokeOnDestroy joins CommandProcessor.
+  rex::SetAppBackgroundPaused(false);
   if (_app) {
     _app->InvokeOnDestroy();
     _app.reset();

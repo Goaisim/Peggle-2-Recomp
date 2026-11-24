@@ -106,6 +106,11 @@ jobs:
           mkdir -p ipa_stage/Payload
           cp -R "${APP_PATH}" ipa_stage/Payload/peggle2.app
           cp peggle2/ios/peggle2.toml ipa_stage/Payload/peggle2.app/peggle2.toml
+          if [ ! -f ipa_stage/Payload/peggle2.app/Assets.car ]; then
+            echo "::error::Assets.car missing from iOS bundle (AppIcon failed to compile)"
+            exit 1
+          fi
+          plutil -p ipa_stage/Payload/peggle2.app/Info.plist | grep -E "CFBundleIcon|AppIcon" || true
 
           codesign --force --sign - \
             --entitlements peggle2/ios/Entitlements.plist \

@@ -61,6 +61,7 @@ if(APPLE AND IOS)
         ios/rexvideo_metal.mm
         ios/msl_translator.cpp
         ios/rexaudio_ios.mm
+        "${CMAKE_CURRENT_SOURCE_DIR}/ios/Assets.xcassets"
     )
     set_source_files_properties(
         ios/main_ios.mm
@@ -149,6 +150,9 @@ if(APPLE AND IOS)
     set_target_properties(peggle2 PROPERTIES
         MACOSX_BUNDLE TRUE
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in"
+        RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ios/Assets.xcassets"
+        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
+        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS "YES"
         XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.peggle2recomp.ios"
         XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/ios/Entitlements.plist"
         XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
@@ -161,6 +165,8 @@ if(APPLE AND IOS)
     )
 else()
     if(WIN32)
+        set_source_files_properties(resources/peggle2.rc PROPERTIES
+            OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/peggle2.ico")
         add_executable(peggle2 WIN32 ${PEGGLE2_SOURCES} resources/peggle2.rc)
     else()
         add_executable(peggle2 ${PEGGLE2_SOURCES})
