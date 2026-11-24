@@ -7,6 +7,7 @@
 #include <bit>
 #include <cassert>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -45,7 +46,11 @@
 #pragma comment(lib, "shell32.lib")
 #else
 #include <cstdlib>
+#include <ctime>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
 #endif
 
 #if REX_PLATFORM_IOS
@@ -511,6 +516,176 @@ static void ResetUserSettings() {
 // Telemetry Counters
 static std::atomic<uint32_t> g_vdswap_calls{0};
 static std::atomic<uint32_t> g_f2c8_updates{0};
+static std::atomic<uint32_t> g_rate_hook_hz{0};
+static std::atomic<uint32_t> g_rate_vdswap_hz{0};
+static std::atomic<uint32_t> g_rate_vblank_hz{0};
+static std::atomic<uint32_t> g_rate_present_hz{0};
+
+#ifndef REX_BUILD_SHA
+#define REX_BUILD_SHA "unknown"
+#endif
+
+static const char* GetAppBuildSha() {
+  constexpr const char* kSha = REX_BUILD_SHA;
+  return (kSha[0] != '\0') ? kSha : "unknown";
+}
+
+constexpr int64_t kGuestHookIntervalNs = 16'666'667LL;
+
+static int64_t QpcTicksToNs(int64_t ticks, int64_t freq) {
+  if (freq <= 0) return 0;
+  const int64_t whole_sec = ticks / freq;
+  const int64_t rem_ticks = ticks % freq;
+  return whole_sec * 1'000'000'000LL + (rem_ticks * 1'000'000'000LL) / freq;
+}
+
+#if defined(__APPLE__) && !defined(_WIN32)
+static const mach_timebase_info_data_t& GetAppleTimebase() {
+  static mach_timebase_info_data_t s_tb = []() {
+    mach_timebase_info_data_t tb{};
+    mach_timebase_info(&tb);
+    if (tb.denom == 0) tb.numer = tb.denom = 1;
+    return tb;
+  }();
+  return s_tb;
+}
+#endif
+
+static int64_t MonotonicGuestClockNs() {
+#ifdef _WIN32
+  static LARGE_INTEGER s_qpc_freq = []() {
+    LARGE_INTEGER f{};
+    QueryPerformanceFrequency(&f);
+    return f;
+  }();
+  LARGE_INTEGER now{};
+  QueryPerformanceCounter(&now);
+  return QpcTicksToNs(now.QuadPart, s_qpc_freq.QuadPart);
+#elif defined(__APPLE__)
+  const auto& tb = GetAppleTimebase();
+  const uint64_t t = mach_absolute_time();
+  const uint64_t whole = t / tb.denom;
+  const uint64_t rem = t % tb.denom;
+  return static_cast<int64_t>(whole * tb.numer + (rem * tb.numer) / tb.denom);
+#else
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + static_cast<int64_t>(ts.tv_nsec);
+#endif
+}
+
+static int64_t AdvanceGuestHookDeadlineNs(int64_t prev_deadline_ns, int64_t wake_ns) {
+  // Prevent post-stall catch-up bursts while allowing <=250 us phase recovery for steady 60.0 Hz.
+  const int64_t next_dl = prev_deadline_ns + kGuestHookIntervalNs;
+  const int64_t min_next = wake_ns + kGuestHookIntervalNs - 250'000LL;
+  return (next_dl < min_next) ? (wake_ns + kGuestHookIntervalNs) : next_dl;
+}
+
+static float PaceGuestHook60Hz() {
+  static std::mutex s_hook_pacer_mutex;
+  static bool s_initialized = false;
+  static int64_t s_next_deadline_ns = 0;
+  static uint64_t s_last_bg_pause_count = 0;
+
+  if (rex::IsAppBackgroundPaused()) {
+    rex::WaitWhileAppBackgroundPaused();
+    std::lock_guard<std::mutex> lock(s_hook_pacer_mutex);
+    s_initialized = false;
+  }
+
+  int64_t deadline_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(s_hook_pacer_mutex);
+    const uint64_t bg_cnt = rex::GetAppBackgroundPauseCount();
+    const int64_t now_ns = MonotonicGuestClockNs();
+    if (!s_initialized || bg_cnt != s_last_bg_pause_count) {
+      s_last_bg_pause_count = bg_cnt;
+      s_next_deadline_ns = now_ns + kGuestHookIntervalNs;
+      s_initialized = true;
+      return 0.0f;
+    }
+    deadline_ns = s_next_deadline_ns;
+    if (now_ns >= deadline_ns) {
+      s_next_deadline_ns = AdvanceGuestHookDeadlineNs(deadline_ns, now_ns);
+      return 0.0f;
+    }
+  }
+
+  const int64_t sleep_start_ns = MonotonicGuestClockNs();
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+  struct HiResTimerHandle {
+    HANDLE h = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    ~HiResTimerHandle() {
+      if (h) CloseHandle(h);
+    }
+  };
+  thread_local HiResTimerHandle tls_timer;
+  if (tls_timer.h) {
+    while (true) {
+      const int64_t cur_ns = MonotonicGuestClockNs();
+      const int64_t rem_ns = deadline_ns - cur_ns;
+      if (rem_ns <= 0) break;
+      if (rem_ns > 800'000LL) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -((rem_ns - 600'000LL) / 100LL);
+        if (SetWaitableTimer(tls_timer.h, &due, 0, nullptr, nullptr, FALSE)) {
+          WaitForSingleObject(tls_timer.h, INFINITE);
+        } else {
+          Sleep(1);
+        }
+      } else {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        YieldProcessor();
+#endif
+      }
+    }
+  } else {
+    static std::once_flag s_win_period_once;
+    std::call_once(s_win_period_once, []() { timeBeginPeriod(1); });
+    while (true) {
+      const int64_t cur_ns = MonotonicGuestClockNs();
+      const int64_t rem_ns = deadline_ns - cur_ns;
+      if (rem_ns <= 0) break;
+      if (rem_ns > 1'500'000LL) {
+        Sleep(1);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  }
+#elif defined(__APPLE__)
+  const auto& tb = GetAppleTimebase();
+  const int64_t rem_ns = deadline_ns - sleep_start_ns;
+  if (rem_ns > 0) {
+    const uint64_t rem_ticks =
+        (static_cast<uint64_t>(rem_ns) / tb.numer) * tb.denom +
+        ((static_cast<uint64_t>(rem_ns) % tb.numer) * tb.denom) / tb.numer;
+    mach_wait_until(mach_absolute_time() + rem_ticks);
+  }
+#else
+  struct timespec ts{};
+  ts.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000LL);
+  ts.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000LL);
+  while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {}
+#endif
+
+  const int64_t wake_ns = MonotonicGuestClockNs();
+  {
+    std::lock_guard<std::mutex> lock(s_hook_pacer_mutex);
+    if (rex::IsAppBackgroundPaused()) {
+      s_initialized = false;
+    } else {
+      s_next_deadline_ns = AdvanceGuestHookDeadlineNs(deadline_ns, wake_ns);
+    }
+  }
+  return static_cast<float>(std::max<int64_t>(0, wake_ns - sleep_start_ns)) / 1'000'000.0f;
+}
 static std::atomic<float> g_telemetry_rendered_fps{60.0f};
 static std::atomic<float> g_telemetry_host_fps{60.0f};
 static std::atomic<float> g_telemetry_sim_fps{60.0f};
@@ -1578,6 +1753,12 @@ static void RunColliderSelfCheck() {
 #endif
     TC_ASSERT(TargetFpsIndexFromHz(40) == kFps40);
     TC_ASSERT(TargetFpsIndexFromHz(60) == kFps60);
+    TC_ASSERT(QpcTicksToNs(10'000'000LL, 10'000'000LL) == 1'000'000'000LL);
+    TC_ASSERT(QpcTicksToNs(166'667LL, 10'000'000LL) == 16'666'700LL);
+    TC_ASSERT(AdvanceGuestHookDeadlineNs(100'000'000LL, 100'050'000LL) ==
+              100'000'000LL + kGuestHookIntervalNs);
+    TC_ASSERT(AdvanceGuestHookDeadlineNs(100'000'000LL, 120'000'000LL) ==
+              120'000'000LL + kGuestHookIntervalNs);
     if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 8 (pause hover + visual turret + deadzone) passed\n");
     rex_monitor::ClearTestState();
   }
@@ -2254,12 +2435,6 @@ extern "C" REX_FUNC(sub_8261FE50) {
       }
     }
   }
-
-  static bool s_win_timer_init = false;
-  if (!s_win_timer_init) {
-    timeBeginPeriod(1);
-    s_win_timer_init = true;
-  }
 #endif
 
   // Synchronize presentation interval and SDK vsync/refresh settings
@@ -2370,32 +2545,12 @@ extern "C" REX_FUNC(sub_8261FE50) {
   rex::SetGuestLastLR(static_cast<uint32_t>(ctx.lr));
   rex::SetGuestThreadState(1);
   rex::RecordGuestTick();
+  rex::ui::Presenter::SetExternalGuestPacerActive(true);
   __imp__sub_8261FE50(ctx, base);
 
-  // Fail-safe monotonic 60.0 Hz guest swap ceiling in case an underlying swap returns early.
-  {
-    constexpr auto kMinSwapInterval = std::chrono::nanoseconds(16666667);
-    static bool s_swap_guard_init = false;
-    static std::chrono::steady_clock::time_point s_next_swap_guard{};
-    auto post_now = std::chrono::steady_clock::now();
-    if (!s_swap_guard_init || s_next_swap_guard > post_now + kMinSwapInterval) {
-      s_next_swap_guard = post_now + kMinSwapInterval;
-      s_swap_guard_init = true;
-    } else if (post_now > s_next_swap_guard + std::chrono::milliseconds(4)) {
-      s_next_swap_guard = post_now + kMinSwapInterval;
-    } else {
-      while (post_now < s_next_swap_guard) {
-        auto rem = std::chrono::duration_cast<std::chrono::nanoseconds>(s_next_swap_guard - post_now).count();
-        if (rem > 2200000LL) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        } else {
-          std::this_thread::yield();
-        }
-        post_now = std::chrono::steady_clock::now();
-      }
-      s_next_swap_guard += kMinSwapInterval;
-    }
-  }
+  // Authoritative unconditional monotonic 60.0 Hz guest frame boundary across all modes.
+  const float hook_sleep_ms = PaceGuestHook60Hz();
+  rex::ui::Presenter::RecordExternalGuestPacerSleepMs(hook_sleep_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -3246,6 +3401,14 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                               guest_ok ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.9f, 0.2f, 1.0f));
         ImGui::Text("Guest Logic:    %.1f FPS (%.2fx speed)", sim_fps, speed);
         ImGui::PopStyleColor();
+#if !REX_PLATFORM_IOS
+        ImGui::Text("Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s",
+                    g_rate_hook_hz.load(std::memory_order_relaxed),
+                    g_rate_vdswap_hz.load(std::memory_order_relaxed),
+                    g_rate_vblank_hz.load(std::memory_order_relaxed),
+                    g_rate_present_hz.load(std::memory_order_relaxed),
+                    GetAppBuildSha());
+#endif
         ImGui::Text("Render Res:     %ux%u (%.2fx)", ren_w, ren_h, ren_scale);
         ImGui::Text("VSync:          %s", vsync_idx == kVSyncOff ? "Off (Host Pacer)" : "On (Swapchain)");
         ImGui::Text("FPS Limiter:    %s", is_uncapped ? "Uncapped Present" : "Match Target Hz");
@@ -3306,6 +3469,14 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     ren_w, ren_h,
                     (int)g_telemetry_stick_lx.load(std::memory_order_relaxed), rec_tag);
         draw_perf_line(true);
+#if !REX_PLATFORM_IOS
+        ImGui::Text("Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s",
+                    g_rate_hook_hz.load(std::memory_order_relaxed),
+                    g_rate_vdswap_hz.load(std::memory_order_relaxed),
+                    g_rate_vblank_hz.load(std::memory_order_relaxed),
+                    g_rate_present_hz.load(std::memory_order_relaxed),
+                    GetAppBuildSha());
+#endif
       }
     }
     ImGui::End();
@@ -3792,6 +3963,8 @@ static std::filesystem::path ResolveConfigPath(const std::filesystem::path& requ
 
 void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   ArmStartupEnvWatchdogOnce();
+  rex::SetBuildSha(GetAppBuildSha());
+  rex::ui::Presenter::SetExternalGuestPacerActive(true);
   if (auto drag_arg = GetArgument("game"); drag_arg && !drag_arg->empty()) {
     g_cli_positional_game = *drag_arg;
   }
@@ -3968,8 +4141,16 @@ std::optional<rex::PathConfig> Peggle2App::OnFinalizePaths(const rex::PathConfig
 static std::thread g_cadence_reporter([] {
   static uint64_t last_rendered_count = 0;
   static uint64_t last_host_count = 0;
+  static uint64_t last_vdswap_entry_count = 0;
+  static uint64_t last_vblank_count = 0;
+  auto next_report_tp = std::chrono::steady_clock::now() + std::chrono::seconds(1);
   while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_until(next_report_tp);
+    const auto now_tp = std::chrono::steady_clock::now();
+    next_report_tp += std::chrono::seconds(1);
+    if (now_tp > next_report_tp + std::chrono::seconds(1)) {
+      next_report_tp = now_tp + std::chrono::seconds(1);
+    }
     if (rex::IsAppBackgroundPaused()) continue;
     if (g_test_replay_mode.load(std::memory_order_relaxed)) {
       const uint64_t boot_ms = g_test_replay_boot_ms.load(std::memory_order_relaxed);
@@ -3987,9 +4168,22 @@ static std::thread g_cadence_reporter([] {
     uint32_t host = static_cast<uint32_t>(cur_host - last_host_count);
     last_host_count = cur_host;
 
+    const rex::RexBootTelemetrySnapshot tel_snap = rex::GetBootTelemetrySnapshot();
+    const uint64_t cur_vdswap_entry = tel_snap.vd_swaps;
+    const uint32_t vdswap_hz = static_cast<uint32_t>(cur_vdswap_entry - last_vdswap_entry_count);
+    last_vdswap_entry_count = cur_vdswap_entry;
+
+    const uint64_t cur_vblank = tel_snap.vblanks;
+    const uint32_t vblank_hz = static_cast<uint32_t>(cur_vblank - last_vblank_count);
+    last_vblank_count = cur_vblank;
+
     uint32_t f2 = g_f2c8_updates.exchange(0);
-    uint32_t vds = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
-    uint32_t guest_fps_val = (vds > 0) ? vds : f2;
+    uint32_t hook_hz = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
+    uint32_t guest_fps_val = (hook_hz > 0) ? hook_hz : f2;
+    g_rate_hook_hz.store(hook_hz, std::memory_order_relaxed);
+    g_rate_vdswap_hz.store(vdswap_hz, std::memory_order_relaxed);
+    g_rate_vblank_hz.store(vblank_hz, std::memory_order_relaxed);
+    g_rate_present_hz.store(host, std::memory_order_relaxed);
     g_telemetry_rendered_fps.store((float)ren, std::memory_order_relaxed);
     g_telemetry_host_fps.store((float)host, std::memory_order_relaxed);
     g_telemetry_sim_fps.store((float)guest_fps_val, std::memory_order_relaxed);
@@ -4009,11 +4203,14 @@ static std::thread g_cadence_reporter([] {
     const bool has_pm = rex::ui::Presenter::GetActiveProfilingHudMetrics(pm);
     int fps_idx = g_target_fps_index.load(std::memory_order_relaxed);
     float speed = (guest_fps_val > 0) ? ((float)guest_fps_val / 60.0f) : 1.00f;
-    printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Host Present=%u, Rendered FPS=%u, VdSwaps=%u, Sim=%u (%.2fx speed) | "
+    printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s | "
+           "Rendered=%u Sim=%u (%.2fx speed) | "
            "HostFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u >33ms=%u) | "
            "GuestFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u) | "
            "Perf(cpu=%.2f pres=%.2f)\n",
-           kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(), host, ren, vds, f2, speed,
+           kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(),
+           hook_hz, vdswap_hz, vblank_hz, host, GetAppBuildSha(),
+           ren, f2, speed,
            hft.p50, hft.p95, hft.p99, hft.max, hft.over20, hft.over33,
            gft.p50, gft.p95, gft.p99, gft.max, gft.over20,
            has_pm ? pm.avg_cpu_ms : -1.0f, has_pm ? pm.avg_present_ms : -1.0f);
