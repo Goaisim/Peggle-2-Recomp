@@ -2,3 +2,6 @@ license_mask = 1
 vsync = true
 occlusion_query_enable = false
 async_shader_compilation = true
+readback_memexport = false
+# Optional: set target_fps = 40 (or 60 / 120) to lock startup Framerate Mode:
+# target_fps = 40

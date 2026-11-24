@@ -190,9 +190,30 @@ class MetalShader final : public Shader {
   }
 };
 
+static std::atomic<float> g_perf_enc_ms{0.0f};
+static std::atomic<float> g_perf_gpu_ms{0.0f};
 static std::atomic<uint32_t> g_perf_draws{0};
 static std::atomic<uint32_t> g_perf_tex_uploads{0};
 static std::atomic<uint32_t> g_perf_buf_allocs{0};
+
+static void SmoothPerfMs(std::atomic<float>& dst, float sample_ms) {
+  if (!std::isfinite(sample_ms) || sample_ms < 0.0f) return;
+  const float cur = dst.load(std::memory_order_relaxed);
+  dst.store(cur <= 0.0f ? sample_ms : (cur * 0.75f + sample_ms * 0.25f),
+            std::memory_order_relaxed);
+}
+
+struct MetalEncScope {
+  uint64_t& acc_ns;
+  std::chrono::steady_clock::time_point t0;
+  explicit MetalEncScope(uint64_t& acc)
+      : acc_ns(acc), t0(std::chrono::steady_clock::now()) {}
+  ~MetalEncScope() {
+    acc_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count());
+  }
+};
 static std::atomic<uint32_t> g_cur_buf_allocs{0};
 static std::atomic<uint64_t> g_guest_frame_seq{0};
 static std::mutex g_metal_cmd_mutex;
@@ -1002,6 +1023,7 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool) override {
+    MetalEncScope enc_timer(frame_enc_ns_);
     @autoreleasepool {
     auto& regs = *register_file_;
     auto mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -1294,6 +1316,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   }
 
   bool IssueCopy() override {
+    MetalEncScope enc_timer(frame_enc_ns_);
     @autoreleasepool {
     const auto& regs = *register_file_;
     auto copy = regs.Get<reg::RB_COPY_CONTROL>();
@@ -1395,10 +1418,36 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t fb_width, uint32_t fb_height) override {
     @autoreleasepool {
+      const auto swap_t0 = std::chrono::steady_clock::now();
+      const bool skip_present = skip_gpu_draw() || skip_swap_present();
       const bool in_gameplay_screen =
         rex_monitor::IsInGameplay() && (rex_monitor::GetCurrentScreenId() == SCREEN_GAMEPLAY);
     if (!in_gameplay_screen && ui_sniffer_ && rex::graphics::IsUiQuadSnifferActive()) {
         ui_sniffer_->OnFrameSwap();
+      }
+      if (skip_present) {
+        if (!pending_color_clears_.empty()) {
+          FlushAllColorClears();
+        }
+        EndPass();
+        const uint64_t extra_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - swap_t0)
+                                               .count());
+        SmoothPerfMs(g_perf_enc_ms, float(frame_enc_ns_ + extra_ns) * 1e-6f);
+        frame_enc_ns_ = 0;
+        g_perf_draws.store(frame_draws_, std::memory_order_relaxed);
+        g_perf_tex_uploads.store(frame_tex_uploads_, std::memory_order_relaxed);
+        frame_draws_ = 0;
+        frame_tex_uploads_ = 0;
+        if (commands_) {
+          Submit(false);
+        }
+        ResetConstCache();
+        generation_++;
+        const bool next_075 = rex_ios_is_low_power_075x_active();
+        scale_num_ = next_075 ? 3u : 1u;
+        scale_den_ = next_075 ? 4u : 1u;
+        return;
       }
       auto fetch = register_file_->GetTextureFetch(0);
       id<MTLTexture> fb = GetTexture(fetch);
@@ -1520,6 +1569,11 @@ class MetalCommandProcessor final : public CommandProcessor {
       id<MTLTexture> gamma_tex = GammaRampTexture();
       const bool bg_paused = rex::IsAppBackgroundPaused();
       id<MTLCommandBuffer> swap_cmd = Commands();
+      const uint64_t extra_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - swap_t0)
+                                             .count());
+      SmoothPerfMs(g_perf_enc_ms, float(frame_enc_ns_ + extra_ns) * 1e-6f);
+      frame_enc_ns_ = 0;
       const bool scheduled_ring_sig = (ring_sem_ != nil && swap_cmd != nil);
       if (scheduled_ring_sig) {
         dispatch_semaphore_t sem = ring_sem_;
@@ -1695,7 +1749,11 @@ class MetalCommandProcessor final : public CommandProcessor {
       std::atomic<uint64_t>* done_seq = &completed_submit_seq_;
       std::shared_ptr<CmdHandlerTracker> tracker = handler_tracker_;
       if (tracker) tracker->Schedule();
-      [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> completed_cmd) {
+        if (completed_cmd.GPUEndTime > completed_cmd.GPUStartTime) {
+          SmoothPerfMs(g_perf_gpu_ms,
+                       float((completed_cmd.GPUEndTime - completed_cmd.GPUStartTime) * 1000.0));
+        }
         if (tracker) {
           std::lock_guard<std::mutex> lock(tracker->mutex);
           if (tracker->alive) {
@@ -2682,6 +2740,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<uint8_t> tex_upload_rgba_;
   uint32_t frame_draws_ = 0;
   uint32_t frame_tex_uploads_ = 0;
+  uint64_t frame_enc_ns_ = 0;
 
   uint64_t generation_ = 1;
   uint64_t next_submit_seq_ = 1;
@@ -2734,6 +2793,10 @@ std::unique_ptr<rex::graphics::GraphicsSystem> rex_ios_create_graphics_system() 
 
 RexIosPerfSnapshot rex_ios_get_perf_snapshot() {
   RexIosPerfSnapshot s{};
+  const auto gfb = rex::ui::Presenter::GetGuestFrameBreakdown();
+  s.cpu_ms = gfb.active_work_ms;
+  s.enc_ms = rex_ios::g_perf_enc_ms.load(std::memory_order_relaxed);
+  s.gpu_ms = rex_ios::g_perf_gpu_ms.load(std::memory_order_relaxed);
   s.draws_per_frame = rex_ios::g_perf_draws.load(std::memory_order_relaxed);
   s.tex_uploads_per_frame = rex_ios::g_perf_tex_uploads.load(std::memory_order_relaxed);
   s.buf_allocs_per_frame = rex_ios::g_perf_buf_allocs.load(std::memory_order_relaxed);

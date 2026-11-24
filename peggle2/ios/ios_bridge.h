@@ -216,6 +216,9 @@ void rex_ios_on_touch_cancelled();
 RexIosTouchSnapshot rex_ios_consume_touch_for_guest();
 
 struct RexIosPerfSnapshot {
+  float cpu_ms = 0.0f;
+  float enc_ms = 0.0f;
+  float gpu_ms = 0.0f;
   uint32_t draws_per_frame = 0;
   uint32_t tex_uploads_per_frame = 0;
   uint32_t buf_allocs_per_frame = 0;
@@ -226,6 +229,7 @@ const char* rex_ios_get_thermal_state_name();
 uint64_t rex_ios_get_guest_frame_seq();
 void rex_ios_wait_for_metal_idle();
 void rex_ios_audio_set_paused(bool paused);
+void rex_ios_set_target_fps(uint32_t hz);
 void rex_ios_set_low_power_auto_scale_enabled(bool enabled);
 bool rex_ios_is_low_power_075x_active();
 

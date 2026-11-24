@@ -86,6 +86,14 @@ uint64_t TouchNowMs() {
                                    .count());
 }
 
+uint64_t SteadyNowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+static std::atomic<uint32_t> g_ios_target_fps{60};
+
 void BumpUiRedrawWindow(uint64_t duration_ms = 250) {
   const uint64_t deadline = TouchNowMs() + duration_ms;
   uint64_t cur = g_ui_redraw_until_ms.load(std::memory_order_relaxed);
@@ -308,6 +316,8 @@ class IOSGCInputDriver final : public rex::input::InputDriver {
 };
 
 }  // namespace
+
+static void UpdatePowerAndThermalState();
 
 namespace rex::ui {
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
@@ -771,8 +781,10 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
   CADisplayLink* _displayLink;
   uint64_t _lastPresentedGuestSeq;
   uint64_t _lastPresentedMs;
+  uint64_t _next40HzDeadlineNs;
 }
 - (void)setRenderPaused:(BOOL)paused;
+- (void)updateDisplayLinkFrameRate:(uint32_t)hz;
 @end
 
 @implementation PeggleViewController
@@ -813,17 +825,34 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
   [super viewDidAppear:animated];
   if (!_displayLink) {
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame:)];
-    if (@available(iOS 15.0, *)) {
-      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-      _displayLink.preferredFramesPerSecond = 60;
-#pragma clang diagnostic pop
-    }
+    [self updateDisplayLinkFrameRate:g_ios_target_fps.load(std::memory_order_relaxed)];
     _displayLink.paused = rex::IsAppBackgroundPaused() ? YES : NO;
     [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     g_display_link_active.store(true, std::memory_order_release);
+  }
+}
+
+- (void)updateDisplayLinkFrameRate:(uint32_t)hz {
+  if (!_displayLink) {
+    return;
+  }
+  if (@available(iOS 15.0, *)) {
+    if (hz == 0) {
+      const float max_hz = float(std::max<NSInteger>(60, [UIScreen mainScreen].maximumFramesPerSecond));
+      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, max_hz, max_hz);
+    } else if (hz <= 40) {
+      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(float(hz), float(hz), float(hz));
+    } else {
+      const float max_hz =
+          float(std::max<NSInteger>(hz, [UIScreen mainScreen].maximumFramesPerSecond));
+      _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, max_hz, float(hz));
+    }
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    _displayLink.preferredFramesPerSecond =
+        (hz == 0) ? [UIScreen mainScreen].maximumFramesPerSecond : NSInteger(hz);
+#pragma clang diagnostic pop
   }
 }
 
@@ -849,7 +878,24 @@ RexIosTouchSnapshot rex_ios_consume_touch_for_guest() {
   (void)link;
   @autoreleasepool {
     if (rex::IsAppBackgroundPaused()) return;
+    UpdatePowerAndThermalState();
     if (g_ios_app_ctx) g_ios_app_ctx->ExecutePendingFunctionsFromUIThread();
+    const uint32_t target_hz = g_ios_target_fps.load(std::memory_order_relaxed);
+    if (target_hz == 40) {
+      // Smooth 25.0 ms host gate so ProMotion locks to 40 Hz and 60 Hz panels pace 3:2 cleanly.
+      const uint64_t now_ns = SteadyNowNs();
+      constexpr uint64_t kInterval40HzNs = 25000000ull;
+      if (_next40HzDeadlineNs != 0 && now_ns + 2000000ull < _next40HzDeadlineNs) {
+        return;
+      }
+      if (_next40HzDeadlineNs == 0 || now_ns > _next40HzDeadlineNs + kInterval40HzNs * 2ull) {
+        _next40HzDeadlineNs = now_ns + kInterval40HzNs;
+      } else {
+        _next40HzDeadlineNs += kInterval40HzNs;
+      }
+    } else {
+      _next40HzDeadlineNs = 0;
+    }
     const uint64_t guest_seq = rex_ios_get_guest_frame_seq();
     const uint64_t now_ms = TouchNowMs();
     const bool new_guest_frame = (guest_seq != _lastPresentedGuestSeq);
@@ -1555,6 +1601,18 @@ static void UpdatePowerAndThermalState() {
                                   std::memory_order_relaxed);
 }
 
+void rex_ios_set_target_fps(uint32_t hz) {
+  if (g_ios_target_fps.exchange(hz, std::memory_order_relaxed) == hz) {
+    return;
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIViewController* root = g_root_vc;
+    if ([root isKindOfClass:[PeggleViewController class]]) {
+      [(PeggleViewController*)root updateDisplayLinkFrameRate:hz];
+    }
+  });
+}
+
 void rex_ios_set_low_power_auto_scale_enabled(bool enabled) {
   g_low_power_auto_scale_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -1563,6 +1621,7 @@ bool rex_ios_is_low_power_075x_active() {
   if (!g_low_power_auto_scale_enabled.load(std::memory_order_relaxed)) {
     return false;
   }
+  UpdatePowerAndThermalState();
   return g_low_power_mode_active.load(std::memory_order_relaxed) ||
          g_thermal_throttle_active.load(std::memory_order_relaxed);
 }

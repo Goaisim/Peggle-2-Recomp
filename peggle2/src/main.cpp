@@ -51,9 +51,11 @@
 #if REX_PLATFORM_IOS
 #include "../ios/ios_bridge.h"
 #include <rex/audio/audio_system.h>
-#include <rex/graphics/graphics_system.h>
 #include <rex/input/input_system.h>
 #endif
+
+#include <rex/graphics/graphics_system.h>
+#include <rex/runtime.h>
 
 #include "peggle2_app.h"
 #include "rex_engine_monitor.h"
@@ -83,7 +85,8 @@ enum TargetFpsOption {
   kFps120 = 3,
   kFps144 = 4,
   kFpsUncapped = 5,
-  kFpsCount = 6,
+  kFps40 = 6,
+  kFpsCount = 7,
 };
 
 enum VSyncOption {
@@ -187,6 +190,42 @@ static const FpsPresetInfo kFpsPresets[kFpsCount] = {
   { "120 Hz",  120, std::chrono::nanoseconds(8333333),  1.0f / 120.0f, 8.333333f },
   { "144 Hz",  144, std::chrono::nanoseconds(6944444),  1.0f / 144.0f, 6.944444f },
   { "Uncapped",  0, std::chrono::nanoseconds(0),        1.0f / 60.0f, 16.666666f },
+  { "40 Hz",    40, std::chrono::nanoseconds(25000000), 1.0f / 60.0f, 16.666666f },
+};
+
+static constexpr int kFpsCycleOrder[] = {
+  kFps40, kFps60, kFps72, kFps120, kFps144, kFpsUncapped,
+};
+
+static int StepFpsPresetIndex(int cur, int dir) {
+  constexpr int n = int(sizeof(kFpsCycleOrder) / sizeof(kFpsCycleOrder[0]));
+  int pos = 1;  // Default to 60 Hz if currently on legacy kFps30
+  for (int i = 0; i < n; ++i) {
+    if (kFpsCycleOrder[i] == cur) {
+      pos = i;
+      break;
+    }
+  }
+  return kFpsCycleOrder[(pos + (dir >= 0 ? 1 : -1) + n) % n];
+}
+
+static int TargetFpsIndexFromHz(int32_t hz) {
+  switch (hz) {
+    case 40: return kFps40;
+    case 60: return kFps60;
+    case 72: return kFps72;
+    case 120: return kFps120;
+    case 144: return kFps144;
+    case 0: return kFpsUncapped;
+    default: return -1;
+  }
+}
+
+enum EdramModeOption {
+  kEdramAuto = 0,  // Auto (RTV on iGPU)
+  kEdramRtv = 1,   // RTV
+  kEdramRov = 2,   // ROV
+  kEdramCount = 3,
 };
 
 enum TouchControlsOption {
@@ -202,7 +241,7 @@ constexpr int kDefaultTexFilter = kTexOriginal;  // Original 720p bilinear on iO
 constexpr int kDefaultInputStyle = kInputMobileTouch;
 constexpr int kDefaultMouseAim = kAimTouchSlingshot;
 #else
-constexpr int kDefaultTargetFpsIdx = kFps144;
+constexpr int kDefaultTargetFpsIdx = kFps60;
 constexpr int kDefaultVSync = kVSyncOff;
 constexpr int kDefaultTexFilter = kTexAniso;
 constexpr int kDefaultInputStyle = kInputPcMouse;
@@ -210,7 +249,7 @@ constexpr int kDefaultMouseAim = kAimGuestTurretLock;
 #endif
 
 // Global Interactive Settings State
-static std::atomic<int> g_target_fps_index{kDefaultTargetFpsIdx}; // Default: 144 Hz (60 Hz on iOS)
+static std::atomic<int> g_target_fps_index{kDefaultTargetFpsIdx}; // Default: 60 Hz
 static std::atomic<int> g_opt_vsync{kDefaultVSync};     // Default: Off (Host Pacer) / On (VSync) on iOS
 static std::atomic<int> g_opt_limiter{kLimiterMatchTargetHz}; // Default: Match Target Hz
 static std::atomic<int> g_opt_res{kRes720p};        // Default: 1.0x (720p)
@@ -226,15 +265,13 @@ static std::atomic<int> g_opt_mouse_swap{kSwapAuto};        // Default: Auto (Wi
 static std::atomic<int> g_opt_touch_controls{kTouchControlsShow};  // Show corner A/B/Start strip
 #if REX_PLATFORM_IOS
 static std::atomic<int> g_opt_low_power_scale{1};  // Auto 0.75x in Low Power Mode / Serious thermal
+#else
+static std::atomic<int> g_opt_edram_mode{kEdramAuto};  // Auto (RTV on iGPU) / RTV / ROV
 #endif
 
 static std::atomic<bool> g_menu_open{false};
 static int g_selected_menu_item = 0;
-#if REX_PLATFORM_IOS
 constexpr int kMenuItemCount = 15;
-#else
-constexpr int kMenuItemCount = 14;
-#endif
 
 // Corner touch strip (A / B / Start) + HUD toggle exclusion rect state shared with XInput hook.
 static std::atomic<uint16_t> g_ios_corner_held_mask{0};
@@ -292,11 +329,16 @@ static const SettingEntry kSettingEntries[kMenuItemCount] = {
   { "touch_buttons", &g_opt_touch_controls, kTouchControlsShow,    kTouchControlsCount },
 #if REX_PLATFORM_IOS
   { "low_power_scale", &g_opt_low_power_scale, 1,                  2 },
+#else
+  { "edram_mode",    &g_opt_edram_mode,     kEdramAuto,            kEdramCount },
 #endif
 };
 
 static std::filesystem::path g_settings_ini_path;
+static std::filesystem::path g_active_config_path;
 static std::mutex g_settings_io_mutex;
+static bool g_ini_had_target_fps = false;
+static bool g_ini_had_edram_mode = false;
 
 static void SaveUserSettings() {
   std::lock_guard<std::mutex> lock(g_settings_io_mutex);
@@ -339,10 +381,18 @@ static void LoadUserSettings(const std::filesystem::path& path) {
       }
       for (const auto& e : kSettingEntries) {
         if (key == e.key && val >= 0 && val < e.count) {
-          if (key == "target_fps" && val == kFps30) {
-            val = kDefaultTargetFpsIdx;
-            reset_saved_30hz = true;
+          if (key == "target_fps") {
+            g_ini_had_target_fps = true;
+            if (val == kFps30) {
+              val = kDefaultTargetFpsIdx;
+              reset_saved_30hz = true;
+            }
           }
+#if !REX_PLATFORM_IOS
+          if (key == "edram_mode") {
+            g_ini_had_edram_mode = true;
+          }
+#endif
           e.value->store(val, std::memory_order_relaxed);
           break;
         }
@@ -354,10 +404,87 @@ static void LoadUserSettings(const std::filesystem::path& path) {
   }
 }
 
+static void UpdateTomlKeyLine(const std::filesystem::path& config_path,
+                              std::initializer_list<const char*> match_keys,
+                              const std::string& new_line, bool insert_at_front) {
+  if (config_path.empty()) return;
+  std::vector<std::string> lines;
+  {
+    std::ifstream in(config_path);
+    std::string line;
+    bool replaced = false;
+    while (std::getline(in, line)) {
+      std::string trimmed = line;
+      while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) {
+        trimmed.erase(trimmed.begin());
+      }
+      bool matched = false;
+      if (trimmed.find('=') != std::string::npos) {
+        for (const char* k : match_keys) {
+          const size_t klen = std::strlen(k);
+          if (trimmed.rfind(k, 0) == 0 &&
+              (trimmed.size() == klen || trimmed[klen] == ' ' || trimmed[klen] == '\t' ||
+               trimmed[klen] == '=')) {
+            matched = true;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        if (!replaced) {
+          lines.push_back(new_line);
+          replaced = true;
+        }
+      } else {
+        lines.push_back(line);
+      }
+    }
+    if (!replaced) {
+      if (insert_at_front) {
+        lines.insert(lines.begin(), new_line);
+      } else {
+        lines.push_back(new_line);
+      }
+    }
+  }
+  std::error_code ec;
+  if (!config_path.parent_path().empty()) {
+    std::filesystem::create_directories(config_path.parent_path(), ec);
+  }
+  std::ofstream out(config_path, std::ios::trunc);
+  for (const auto& l : lines) {
+    out << l << "\n";
+  }
+}
+
+#if !REX_PLATFORM_IOS
+static void ApplyEdramModeSetting(int mode, bool reinit_backend) {
+  const char* val = "";
+  if (mode == kEdramRtv) val = "rtv";
+  else if (mode == kEdramRov) val = "rov";
+  rex::cvar::SetFlagByName("render_target_path_d3d12", val);
+  if (reinit_backend) {
+    std::filesystem::path cfg = g_active_config_path;
+    if (!cfg.empty()) {
+      UpdateTomlKeyLine(cfg, {"render_target_path_d3d12"},
+                        std::string("render_target_path_d3d12 = \"") + val + "\"", false);
+    }
+    if (auto* rt = rex::Runtime::instance()) {
+      if (auto* gs = rt->graphics_system()) {
+        gs->ReinitializeBackendContext();
+      }
+    }
+  }
+}
+#endif
+
 static void ResetUserSettings() {
   for (const auto& e : kSettingEntries) {
     e.value->store(e.default_val, std::memory_order_relaxed);
   }
+#if !REX_PLATFORM_IOS
+  ApplyEdramModeSetting(kEdramAuto, true);
+#endif
   SaveUserSettings();
 }
 
@@ -1412,6 +1539,11 @@ static void RunColliderSelfCheck() {
     ComputeDeadzoneCompensatedStick(-0.300f, dz_lx, dz_lt);
     TC_ASSERT(dz_lt == 0 && dz_lx < -25000);
     TC_ASSERT(kFpsPresets[kFps30].dt_sec <= 0.017f);
+    TC_ASSERT(kFpsPresets[kFps40].hz == 40);
+    TC_ASSERT(kFpsPresets[kFps40].dt_sec <= 0.017f);
+    TC_ASSERT(StepFpsPresetIndex(kFps40, 1) == kFps60);
+    TC_ASSERT(StepFpsPresetIndex(kFps60, -1) == kFps40);
+    TC_ASSERT(TargetFpsIndexFromHz(40) == kFps40);
     if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 8 (pause hover + visual turret + deadzone) passed\n");
     rex_monitor::ClearTestState();
   }
@@ -2070,10 +2202,20 @@ extern "C" REX_FUNC(sub_8261FE50) {
 
     if (left || right) {
       int dir = right ? 1 : -1;
-      if (g_selected_menu_item >= 0 && g_selected_menu_item < kMenuItemCount) {
+      if (g_selected_menu_item == 0) {
+        int cur = g_target_fps_index.load(std::memory_order_relaxed);
+        g_target_fps_index.store(StepFpsPresetIndex(cur, dir), std::memory_order_relaxed);
+        SaveUserSettings();
+      } else if (g_selected_menu_item >= 0 && g_selected_menu_item < kMenuItemCount) {
         const auto& e = kSettingEntries[g_selected_menu_item];
         int cur = e.value->load(std::memory_order_relaxed);
-        e.value->store((cur + dir + e.count) % e.count, std::memory_order_relaxed);
+        int next = (cur + dir + e.count) % e.count;
+        e.value->store(next, std::memory_order_relaxed);
+#if !REX_PLATFORM_IOS
+        if (g_selected_menu_item == 14) {
+          ApplyEdramModeSetting(next, true);
+        }
+#endif
         SaveUserSettings();
       }
     }
@@ -2113,10 +2255,14 @@ extern "C" REX_FUNC(sub_8261FE50) {
     rex::cvar::SetFlagByName("vsync", (vsync == kVSyncOn) ? "true" : "false");
     rex::cvar::SetFlagByName("VSyncInterval", (vsync == kVSyncOn) ? "1" : "0");
     rex::cvar::SetFlagByName("TargetFPS", std::to_string(target_hz));
+    rex::cvar::SetFlagByName("target_fps", std::to_string(target_hz));
     rex::cvar::SetFlagByName("display_refresh_rate", std::to_string(target_hz));
     rex::cvar::SetFlagByName(
         "video_mode_refresh_rate",
         std::to_string(target_hz > 0 ? (std::max)(60u, target_hz) : 240u));
+#if REX_PLATFORM_IOS
+    rex_ios_set_target_fps(target_hz);
+#endif
     last_synced_vsync = vsync;
     last_synced_fps = fps_idx;
     last_synced_limiter = limiter_idx;
@@ -2283,7 +2429,6 @@ struct LocateGameState {
 };
 
 static LocateGameState g_locate_state;
-static std::filesystem::path g_active_config_path;
 static std::string g_cli_positional_game;
 static std::filesystem::path g_active_game_source;
 
@@ -2511,39 +2656,8 @@ static void SaveGameDataRootToToml(const std::filesystem::path& config_path,
   const char* primary_key = "game_path";
   rex::cvar::SetFlagByName("game_path", normalized);
 #endif
-  std::string new_line = std::string(primary_key) + " = \"" + normalized + "\"";
-  std::vector<std::string> lines;
-  {
-    std::ifstream in(config_path);
-    std::string line;
-    bool replaced = false;
-    while (std::getline(in, line)) {
-      std::string trimmed = line;
-      while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
-      const bool is_game_key =
-          ((trimmed.rfind("game_path", 0) == 0 || trimmed.rfind("game_data_root", 0) == 0) &&
-           trimmed.find('=') != std::string::npos);
-      if (is_game_key) {
-        if (!replaced) {
-          lines.push_back(new_line);
-          replaced = true;
-        }
-      } else {
-        lines.push_back(line);
-      }
-    }
-    if (!replaced) {
-      lines.insert(lines.begin(), new_line);
-    }
-  }
-  std::error_code ec;
-  if (!config_path.parent_path().empty()) {
-    std::filesystem::create_directories(config_path.parent_path(), ec);
-  }
-  std::ofstream out(config_path, std::ios::trunc);
-  for (const auto& l : lines) {
-    out << l << "\n";
-  }
+  UpdateTomlKeyLine(config_path, {"game_path", "game_data_root"},
+                    std::string(primary_key) + " = \"" + normalized + "\"", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -3006,12 +3120,20 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
 #endif
       };
 
-      auto draw_ios_perf_line = [&]() {
+      auto draw_perf_line = [&](bool minimal) {
 #if REX_PLATFORM_IOS
+        (void)minimal;
         const RexIosPerfSnapshot ios_perf = rex_ios_get_perf_snapshot();
-        ImGui::Text("Perf: Draws=%u TexUp=%u BufAlloc=%u Therm=%s",
+        ImGui::Text("Perf: CPU=%.2f Enc=%.2f GPU=%.2f Draws=%u TexUp=%u Scale=%.2fx Therm=%s",
+                    ios_perf.cpu_ms, ios_perf.enc_ms, ios_perf.gpu_ms,
                     ios_perf.draws_per_frame, ios_perf.tex_uploads_per_frame,
-                    ios_perf.buf_allocs_per_frame, rex_ios_get_thermal_state_name());
+                    ren_scale, rex_ios_get_thermal_state_name());
+#else
+        const auto gfb = rex::ui::Presenter::GetGuestFrameBreakdown();
+        ImGui::Text(minimal ? "Perf: CPU=%.2f GPU=%.2f Draws=%u EDRAM=%s"
+                            : "Perf:     CPU=%.2f GPU=%.2f Draws=%u EDRAM=%s",
+                    gfb.active_work_ms, gfb.gpu_hw_ms, gfb.draw_calls_per_frame,
+                    rex::ui::Presenter::GetActiveEdramPathName());
 #endif
       };
 
@@ -3036,7 +3158,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     static_cast<unsigned long long>(boot_tel.guest_draws),
                     static_cast<unsigned long long>(boot_tel.shaders_compiled),
                     static_cast<unsigned long long>(boot_tel.vd_swaps));
-        draw_ios_perf_line();
+        draw_perf_line(false);
         ImGui::Text("VFS:       OK=%u | Fail=%u | Last=%s",
                     boot_tel.vfs_opens_ok, boot_tel.vfs_opens_fail,
                     boot_tel.last_fail[0] ? boot_tel.last_fail : "None");
@@ -3120,7 +3242,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     host_fps, host_ms, ren_fps, sim_fps, speed,
                     ren_w, ren_h,
                     (int)g_telemetry_stick_lx.load(std::memory_order_relaxed), rec_tag);
-        draw_ios_perf_line();
+        draw_perf_line(true);
       }
     }
     ImGui::End();
@@ -3177,7 +3299,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
       int fps_idx = g_target_fps_index.load(std::memory_order_relaxed);
       draw_option(0, "Target FPS / Hz:", kFpsPresets[fps_idx].name, [](int dir) {
         int cur = g_target_fps_index.load(std::memory_order_relaxed);
-        g_target_fps_index.store((cur + dir + kFpsCount) % kFpsCount, std::memory_order_relaxed);
+        g_target_fps_index.store(StepFpsPresetIndex(cur, dir), std::memory_order_relaxed);
       });
 
       // 2. VSync
@@ -3299,6 +3421,19 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         (void)dir;
         int cur = g_opt_low_power_scale.load(std::memory_order_relaxed);
         g_opt_low_power_scale.store(cur ? 0 : 1, std::memory_order_relaxed);
+      });
+#else
+      // 15. EDRAM Path (Auto defaults to RTV on Integrated GPUs)
+      int edram_idx = g_opt_edram_mode.load(std::memory_order_relaxed);
+      char edram_auto_label[48];
+      snprintf(edram_auto_label, sizeof(edram_auto_label), "Auto (RTV on iGPU [%s])",
+               rex::ui::Presenter::GetActiveEdramPathName());
+      const char* edram_names[kEdramCount] = { edram_auto_label, "RTV", "ROV" };
+      draw_option(14, "EDRAM Mode:", edram_names[edram_idx], [](int dir) {
+        int cur = g_opt_edram_mode.load(std::memory_order_relaxed);
+        int next = (cur + dir + kEdramCount) % kEdramCount;
+        g_opt_edram_mode.store(next, std::memory_order_relaxed);
+        ApplyEdramModeSetting(next, true);
       });
 #endif
 
@@ -3646,6 +3781,20 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   if (settings_dir.empty()) settings_dir = GetExeDirectory();
 #endif
   LoadUserSettings(settings_dir / "peggle2_settings.ini");
+  if (rex::cvar::HasNonDefaultValue("target_fps")) {
+    if (int idx = TargetFpsIndexFromHz(REXCVAR_GET(target_fps)); idx >= 0) {
+      g_target_fps_index.store(idx, std::memory_order_relaxed);
+    }
+  }
+#if !REX_PLATFORM_IOS
+  if (!g_ini_had_edram_mode && rex::cvar::HasNonDefaultValue("render_target_path_d3d12")) {
+    const std::string p = REXCVAR_QUERY(std::string, render_target_path_d3d12);
+    if (p == "rtv") g_opt_edram_mode.store(kEdramRtv, std::memory_order_relaxed);
+    else if (p == "rov") g_opt_edram_mode.store(kEdramRov, std::memory_order_relaxed);
+    else g_opt_edram_mode.store(kEdramAuto, std::memory_order_relaxed);
+  }
+  ApplyEdramModeSetting(g_opt_edram_mode.load(std::memory_order_relaxed), false);
+#endif
   if (IsTestReplayMode()) {
     const uint64_t boot_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3671,10 +3820,14 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   rex::cvar::SetFlagByName("vsync",
                            g_opt_vsync.load(std::memory_order_relaxed) == kVSyncOn ? "true" : "false");
   rex::cvar::SetFlagByName("TargetFPS", std::to_string(startup_hz));
+  rex::cvar::SetFlagByName("target_fps", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("display_refresh_rate", std::to_string(startup_hz));
   rex::cvar::SetFlagByName(
       "video_mode_refresh_rate",
       std::to_string(startup_hz > 0 ? (std::max)(60u, startup_hz) : 240u));
+#if REX_PLATFORM_IOS
+  rex_ios_set_target_fps(startup_hz);
+#endif
   paths.game_data_root = ResolveGameDataFolder(paths.game_data_root);
 }
 
@@ -4408,6 +4561,25 @@ extern "C" REX_FUNC(sub_8260D410) {
           }
         }
 
+        static int64_t s_last_pointer_activity_ms = 0;
+        if (cursor_enabled && !menu_open && !s_controller_active &&
+            (cursor_moved || raw_primary_down || primary_pressed || primary_released ||
+             raw_secondary_down || wheel != 0)) {
+          s_last_pointer_activity_ms = now_ms;
+        }
+        const bool show_colliders =
+            (g_opt_ui_colliders.load(std::memory_order_relaxed) == kCollidersOn);
+        const bool sw_needed_gameplay =
+            show_colliders ||
+            (cursor_enabled && !s_controller_active && !menu_open &&
+             (aim_mode_now == kAimStickServo || aim_mode_now == kAimMouseDelta) &&
+             (now_ms - s_last_pointer_activity_ms) < 500);
+        const bool sw_needed_menu =
+            show_colliders || g_test_replay_mode.load(std::memory_order_relaxed) ||
+            (cursor_enabled && !s_controller_active && !menu_open);
+        rex::ui::Presenter::SetScreenWatcherPaused(
+            in_gameplay ? !sw_needed_gameplay : !sw_needed_menu);
+
         g_hud_cursor_nx.store(norm_x, std::memory_order_relaxed);
         g_hud_cursor_ny.store(norm_y, std::memory_order_relaxed);
         g_hud_cursor_valid.store(cursor_in_vp && !menu_open, std::memory_order_relaxed);
@@ -4733,6 +4905,9 @@ extern "C" REX_FUNC(sub_8260D410) {
           }
         }
       } else {
+        rex::ui::Presenter::SetScreenWatcherPaused(
+            (g_opt_ui_colliders.load(std::memory_order_relaxed) != kCollidersOn) &&
+            !g_test_replay_mode.load(std::memory_order_relaxed));
         g_hud_cursor_valid.store(false, std::memory_order_relaxed);
         g_touch_dragging.store(false, std::memory_order_relaxed);
         s_has_last_screen_cursor = false;
