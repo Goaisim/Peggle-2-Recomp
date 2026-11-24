@@ -1565,6 +1565,7 @@ static void RunColliderSelfCheck() {
     TC_ASSERT(kFpsPresets[kFps120].dt_sec <= 0.017f);
     TC_ASSERT(kFpsPresets[kFps144].dt_sec <= 0.017f);
     TC_ASSERT(kFps120 == 3 && kFps144 == 4 && kFps40 == 6);
+    TC_ASSERT(kLimiterMatchTargetHz == 0 && kLimiterUncapped == 1);
     TC_ASSERT(StepFpsPresetIndex(kFps40, 1) == kFps60);
     TC_ASSERT(StepFpsPresetIndex(kFps60, -1) == kFps40);
 #if REX_PLATFORM_IOS
@@ -3862,12 +3863,14 @@ void Peggle2App::OnConfigurePaths(rex::PathConfig& paths) {
   }
 #endif
   const uint32_t startup_hz = GetActiveTargetFps();
-  rex::cvar::SetFlagByName("vsync",
-                           g_opt_vsync.load(std::memory_order_relaxed) == kVSyncOn ? "true" : "false");
+  const int startup_vsync = g_opt_vsync.load(std::memory_order_relaxed);
+  rex::cvar::SetFlagByName("vsync", startup_vsync == kVSyncOn ? "true" : "false");
+  rex::cvar::SetFlagByName("VSyncInterval", startup_vsync == kVSyncOn ? "1" : "0");
   rex::cvar::SetFlagByName("TargetFPS", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("target_fps", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("display_refresh_rate", std::to_string(startup_hz));
   rex::cvar::SetFlagByName("video_mode_refresh_rate", "60");
+  rex::cvar::SetFlagByName("guest_time_scalar", "1.0");
 #if REX_PLATFORM_IOS
   rex_ios_set_target_fps(startup_hz);
 #endif
