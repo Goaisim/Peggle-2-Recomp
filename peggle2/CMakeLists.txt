@@ -216,8 +216,6 @@ else()
         endif()
         rexglue_configure_target(peggle2 GPU_PLUGINS xenos)
     endif()
-
-    target_compile_definitions(peggle2 PRIVATE REX_BUILD_SHA="${PEGGLE2_GIT_SHA}")
     if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         if(TARGET peggle2_recomp)
             target_compile_options(peggle2_recomp PRIVATE $<$<CONFIG:Release>:-O3 -flto=thin>)
@@ -264,3 +262,24 @@ else()
         endif()
     endif()
 endif()
+
+target_include_directories(peggle2 PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.."
+        "-DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/generated/peggle2_build_sha.h"
+        "-DFALLBACK_SHA=${PEGGLE2_GIT_SHA}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_build_sha.cmake"
+)
+add_custom_target(peggle2_git_sha
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.."
+        "-DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/generated/peggle2_build_sha.h"
+        "-DFALLBACK_SHA=${PEGGLE2_GIT_SHA}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_build_sha.cmake"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/generated/peggle2_build_sha.h"
+    COMMENT "Updating Peggle2 build Git SHA header"
+)
+add_dependencies(peggle2 peggle2_git_sha)
+set_source_files_properties(src/main.cpp PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/generated/peggle2_build_sha.h")

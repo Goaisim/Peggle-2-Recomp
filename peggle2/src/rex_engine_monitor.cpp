@@ -565,7 +565,12 @@ void UpdateScreenWatcherFrameLocked(uint64_t now_ms) {
     pix_hash ^= hash_px[i];
     pix_hash *= 16777619u;
   }
-  g_sw_status.pixel_hash = hash_bytes ? pix_hash : 0u;
+  const uint32_t new_hash = hash_bytes ? pix_hash : 0u;
+  if (new_hash != 0u &&
+      (new_hash != g_sw_status.pixel_hash || g_sw_status.last_hash_change_ms == 0)) {
+    g_sw_status.last_hash_change_ms = now_ms;
+  }
+  g_sw_status.pixel_hash = new_hash;
 
   const size_t px_count = size_t(g_sw_curr_frame.width) * size_t(g_sw_curr_frame.height);
   if (px_count > 0 && g_sw_prev_frame.pixels.size() == g_sw_curr_frame.pixels.size()) {
@@ -2181,6 +2186,7 @@ void InjectSyntheticFrameForTest(const uint8_t* pixels_rgbl, uint32_t width, uin
   g_sw_curr_frame.pixels.assign(pixels_rgbl, pixels_rgbl + size_t(width) * size_t(height) * 4);
   g_sw_status.last_frame_seq = seq;
   g_sw_status.last_update_ms = g_sw_curr_frame.timestamp_ms;
+  g_sw_status.last_hash_change_ms = g_sw_curr_frame.timestamp_ms;
   g_sw_status.has_pixel_frame = true;
   g_sw_status.motion_pct = 0.0f;
   g_sw_status.in_transition = false;

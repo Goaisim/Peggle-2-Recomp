@@ -1,6 +1,7 @@
 // peggle2 - ReXGlue Recompiled Project
 
 #include "generated/default/peggle2_init.h"
+#include "peggle2_build_sha.h"
 
 #include <algorithm>
 #include <atomic>
@@ -560,12 +561,12 @@ struct ScopedMainThreadStage {
   ~ScopedMainThreadStage() { g_main_xthread_stage.store(prev, std::memory_order_release); }
 };
 
-#ifndef REX_BUILD_SHA
-#define REX_BUILD_SHA "unknown"
+#ifndef PEGGLE2_BUILD_SHA
+#define PEGGLE2_BUILD_SHA "unknown"
 #endif
 
 static const char* GetAppBuildSha() {
-  constexpr const char* kSha = REX_BUILD_SHA;
+  constexpr const char* kSha = PEGGLE2_BUILD_SHA;
   return (kSha[0] != '\0') ? kSha : "unknown";
 }
 
@@ -3272,6 +3273,11 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
   const int64_t sw_stale_ms =
+      (sw_st.last_hash_change_ms > 0)
+          ? (now_ms_log - static_cast<int64_t>(sw_st.last_hash_change_ms))
+          : ((sw_st.last_update_ms > 0) ? (now_ms_log - static_cast<int64_t>(sw_st.last_update_ms))
+                                        : -1);
+  const int64_t sw_sample_age_ms =
       (sw_st.last_update_ms > 0) ? (now_ms_log - static_cast<int64_t>(sw_st.last_update_ms)) : -1;
 
 #ifdef _WIN32
@@ -3322,7 +3328,7 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
   std::fprintf(f,
                "GpuRates: Draws=%u/s Res=%u/s Early=%llu (%s) Tmo=%llu Lost=%d Removed=0x%08X | "
                "Frontbuffer=0x%08X (%ux%u) | Totals: Draws=%llu Resolves=%llu\n"
-               "ScreenWatcher: seq=%llu hash=0x%08X screen=%s cand=%zu motion=%.1f%% stale_ms=%lld hl=%s tgt=%s\n"
+               "ScreenWatcher: seq=%llu hash=0x%08X screen=%s cand=%zu motion=%.1f%% stale_ms=%lld sample_age_ms=%lld hl=%s tgt=%s\n"
                "InputState: active=%d ctrl=%d in_vp=%d nx=%.3f ny=%.3f primary=%d buttons=0x%04X menu_open=%d\n",
                cp.gpu_draws_per_sec, cp.gpu_resolves_per_sec,
                static_cast<unsigned long long>(cp.issue_swap_early_returns),
@@ -3335,6 +3341,7 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
                static_cast<unsigned long long>(sw_st.last_frame_seq), sw_st.pixel_hash,
                sw_st.screen_name[0] ? sw_st.screen_name : "UNKNOWN", sw_cands.size(),
                sw_st.motion_pct, static_cast<long long>(sw_stale_ms),
+               static_cast<long long>(sw_sample_age_ms),
                sw_st.has_highlight ? sw_st.hl_name : "none",
                sw_st.has_target ? sw_st.target_name : "None",
                g_input_debug_game_active.load(std::memory_order_relaxed) ? 1 : 0,
@@ -3372,6 +3379,22 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
                  cp.device_removed_reason,
                  static_cast<unsigned long long>(cp.issue_swap_count),
                  static_cast<unsigned long long>(cp.refresh_guest_output_count));
+    std::fprintf(
+        f,
+        "SwapBinding: fb=0x%08X | tex=0x%llX | scaled=%d | upd_sub=%llu | cur_sub=%llu\n"
+        "RecentResolves (%u):\n",
+        cp.last_frontbuffer_ptr, static_cast<unsigned long long>(cp.swap_texture_ptr),
+        cp.swap_is_scaled ? 1 : 0, static_cast<unsigned long long>(cp.swap_last_updated_sub),
+        static_cast<unsigned long long>(cp.submission_current), cp.recent_resolve_count);
+    for (uint32_t i = 0; i < cp.recent_resolve_count && i < 4u; ++i) {
+      const auto& r = cp.recent_resolves[i];
+      std::fprintf(
+          f,
+          "  [%u] dest=0x%08X size=0x%X edram=0x%X fmt=%u depth=%d skip=%d (%s) scaled=%d res=0x%llX\n",
+          i, r.dest_base, r.dest_size, r.edram_base, r.format, r.is_depth ? 1 : 0,
+          r.was_skipped ? 1 : 0, r.skip_reason ? r.skip_reason : "none", r.wrote_scaled ? 1 : 0,
+          static_cast<unsigned long long>(r.target_resource_ptr));
+    }
   }
 
 #ifdef _WIN32
@@ -3403,7 +3426,11 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
   static int64_t s_last_cp_poll_ms = 0;
   static rex::system::CommandProcessorHangState s_cached_cp{};
   static bool s_has_cached_cp = false;
+  static int64_t s_last_sw_poll_ms = 0;
+  static RexScreenWatcherStatus s_cached_sw{};
+  static bool s_has_cached_sw = false;
   static bool s_logged_hang = false;
+  static bool s_logged_stale_frame = false;
 
   const uint64_t cur_hook = g_hook_total_calls.load(std::memory_order_relaxed);
   bool trigger_manual_dump = g_manual_diag_requested.exchange(false, std::memory_order_acq_rel);
@@ -3432,7 +3459,9 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
       g_locate_state.active.load(std::memory_order_acquire)) {
     s_initialized = false;
     s_has_cached_cp = false;
+    s_has_cached_sw = false;
     s_logged_hang = false;
+    s_logged_stale_frame = false;
     g_guest_hang_detected.store(false, std::memory_order_relaxed);
     g_hang_is_gpu_stall.store(false, std::memory_order_relaxed);
     return;
@@ -3492,6 +3521,26 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
     }
   }
 #endif
+
+  if ((now_ms - s_last_sw_poll_ms) >= 250 || !s_has_cached_sw) {
+    s_last_sw_poll_ms = now_ms;
+    std::vector<RexCandidateButton> unused_cands;
+    rex_monitor::GetScreenWatcherState(s_cached_sw, unused_cands);
+    s_has_cached_sw = true;
+  }
+  const int64_t sw_stale_ms =
+      (s_has_cached_sw && s_cached_sw.has_pixel_frame && s_cached_sw.last_hash_change_ms > 0)
+          ? (now_ms - static_cast<int64_t>(s_cached_sw.last_hash_change_ms))
+          : -1;
+  if (s_has_cached_sw && s_cached_sw.screen_id == SCREEN_GAMEPLAY && sw_stale_ms >= 3000 &&
+      s_has_cached_cp && s_cached_cp.refresh_guest_output_count > 0) {
+    if (!s_logged_stale_frame) {
+      s_logged_stale_frame = true;
+      WriteGuestHangLog(boot_tel, static_cast<uint64_t>(sw_stale_ms), cur_hook, true);
+    }
+  } else {
+    s_logged_stale_frame = false;
+  }
 
   const int64_t guest_stall_ms = now_ms - s_last_progress_ms;
   const bool guest_stall = (guest_stall_ms >= 2500);
