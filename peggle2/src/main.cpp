@@ -521,11 +521,14 @@ static std::atomic<uint64_t> g_hook_total_calls{0};
 static std::atomic<uint32_t> g_f2c8_updates{0};
 static std::atomic<uint32_t> g_rate_hook_hz{0};
 static std::atomic<uint32_t> g_rate_vdswap_hz{0};
+static std::atomic<uint32_t> g_rate_gpuswap_hz{0};
 static std::atomic<uint32_t> g_rate_vblank_hz{0};
 static std::atomic<uint32_t> g_rate_present_hz{0};
+static std::atomic<uint32_t> g_guest_gpu_timeout_count{0};
 static std::atomic<uint32_t> g_main_xthread_tid{0};
 static std::atomic<const char*> g_main_xthread_stage{"guest"};
 static std::atomic<bool> g_guest_hang_detected{false};
+static std::atomic<bool> g_hang_is_gpu_stall{false};
 static std::mutex g_hang_hud_mutex;
 static char g_hang_hud_state[96]{};
 
@@ -2647,6 +2650,34 @@ extern "C" REX_FUNC(sub_8261FE50) {
 }
 
 // ---------------------------------------------------------------------------
+// Guest D3D Ringbuffer GPU Timeout Guard (0x82628988)
+// Prevents Xbox D3D from latching device-hung (bit 0x02 at dev+11069) on >2s
+// cold PSO/shader stalls and freezing display updates while audio/input live on.
+// ---------------------------------------------------------------------------
+DECLARE_REX_FUNC(sub_82628988);
+extern "C" REX_FUNC(sub_82628988) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t dev_ptr = ctx.r3.u32;
+  const uint32_t count =
+      g_guest_gpu_timeout_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (count <= 8 || (count % 30) == 0) {
+    uint32_t rb_read_ptr = 0;
+    uint32_t rb_write_ptr = 0;
+    if (dev_ptr) {
+      const uint32_t wb_ptr = REX_LOAD_U32(dev_ptr + 11024);
+      rb_write_ptr = REX_LOAD_U32(dev_ptr + 11036);
+      if (wb_ptr) {
+        rb_read_ptr = REX_LOAD_U32(wb_ptr);
+      }
+    }
+    std::printf("[GPU_TIMEOUT] Guest sub_82628988 #%u (lr=0x%08X dev=0x%08X read=0x%X write=0x%X) - resetting wait without latching hung\n",
+                count, static_cast<uint32_t>(ctx.lr), dev_ptr, rb_read_ptr, rb_write_ptr);
+    std::fflush(stdout);
+  }
+  ctx.r3.u64 = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Simulation Update Hooks (0x8242F2C8 / 0x8243CE30)
 // Retail 30 FPS console loop (sub_8242F8A8 @ 0x8242F9BC) runs two 60 Hz steps per swap;
 // at 60 Hz swaps the second step must run only as a wall-clock catch-up to keep 1.00x speed.
@@ -3142,7 +3173,7 @@ static void WriteResolvedWinStack(FILE* f, const char* label, const uint64_t* pc
 #endif
 
 static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uint64_t stall_ms,
-                              uint64_t total_hooks) {
+                              uint64_t total_hooks, bool is_gpu_stall) {
   rex::system::CommandProcessorHangState cp{};
   bool has_cp = false;
   if (auto* rt = rex::Runtime::instance()) {
@@ -3175,13 +3206,17 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
   const char* stage = g_main_xthread_stage.load(std::memory_order_acquire);
   const char* state_name = rex::GetGuestThreadStateName(boot_tel.guest_state);
   std::fprintf(f,
-               "Peggle 2 Guest Hang Report (Build=%s RT=%s)\n"
-               "StallMs=%llu | TotalHooks=%llu | VdSwaps=%llu | Screen=%u\n"
+               "Peggle 2 %s Report (Build=%s RT=%s)\n"
+               "StallMs=%llu | TotalHooks=%llu | VdSwaps=%llu | GpuSwaps=%llu | IssueSwaps=%llu | GuestGpuTimeouts=%u | Screen=%u\n"
                "MainXThread: State=%s%s | Stage=%s | GuestPC=0x%08X | GuestLR=0x%08X | Ticks=%llu | VBlanks=%llu\n",
+               is_gpu_stall ? "GPU Stall" : "Guest Hang",
                GetAppBuildSha(), rex::GetRuntimeBuildTag(),
                static_cast<unsigned long long>(stall_ms),
                static_cast<unsigned long long>(total_hooks),
                static_cast<unsigned long long>(boot_tel.vd_swaps),
+               static_cast<unsigned long long>(cp.refresh_guest_output_count),
+               static_cast<unsigned long long>(cp.issue_swap_count),
+               g_guest_gpu_timeout_count.load(std::memory_order_relaxed),
                static_cast<unsigned>(rex_monitor::GetCurrentScreenId()),
                state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "",
                stage ? stage : "unknown",
@@ -3201,11 +3236,20 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
   if (has_cp) {
     std::fprintf(f,
                  "CommandProcessor: Stage=%s | read_ptr=0x%X | write_ptr=0x%X | paused=%d | "
-                 "frame_open=%d | in_wait_reg_mem=%d (addr=0x%08X) | in_readback=%d | pending_fns=%u\n",
+                 "frame_open=%d | in_wait_reg_mem=%d (addr=0x%08X) | in_readback=%d | pending_fns=%u | "
+                 "sub_cur=%llu | sub_done=%llu | fence_timeouts=%llu | device_lost=%d | "
+                 "device_removed=0x%08X | issue_swaps=%llu | gpuswaps=%llu\n",
                  cp.worker_stage ? cp.worker_stage : "?",
                  cp.read_ptr, cp.write_ptr, cp.paused ? 1 : 0, cp.frame_open ? 1 : 0,
                  cp.in_wait_reg_mem ? 1 : 0, cp.wait_reg_addr, cp.in_readback ? 1 : 0,
-                 cp.pending_fns_count);
+                 cp.pending_fns_count,
+                 static_cast<unsigned long long>(cp.submission_current),
+                 static_cast<unsigned long long>(cp.submission_completed),
+                 static_cast<unsigned long long>(cp.fence_timeout_count),
+                 cp.device_lost ? 1 : 0,
+                 cp.device_removed_reason,
+                 static_cast<unsigned long long>(cp.issue_swap_count),
+                 static_cast<unsigned long long>(cp.refresh_guest_output_count));
   }
 
 #ifdef _WIN32
@@ -3214,9 +3258,13 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
 #endif
   std::fflush(f);
   std::fclose(f);
-  std::printf("[WATCHDOG] Guest hang (>%llums) logged to %s | State=%s%s [%s]\n",
+  std::printf("[WATCHDOG] %s (>%llums) logged to %s | State=%s%s [%s] | sub=%llu/%llu hr=0x%08X\n",
+              is_gpu_stall ? "GPU stall" : "Guest hang",
               static_cast<unsigned long long>(stall_ms), log_path.string().c_str(),
-              state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "unknown");
+              state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "unknown",
+              static_cast<unsigned long long>(cp.submission_current),
+              static_cast<unsigned long long>(cp.submission_completed),
+              cp.device_removed_reason);
   std::fflush(stdout);
 }
 
@@ -3228,30 +3276,79 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
   static uint64_t s_prev_hook = 0;
   static uint64_t s_prev_vdswap = 0;
   static int64_t s_last_progress_ms = 0;
+  static uint64_t s_prev_gpuswap = 0;
+  static uint64_t s_vdswap_at_gpu_progress = 0;
+  static int64_t s_last_gpu_progress_ms = 0;
+  static int64_t s_last_cp_poll_ms = 0;
+  static rex::system::CommandProcessorHangState s_cached_cp{};
+  static bool s_has_cached_cp = false;
   static bool s_logged_hang = false;
 
   if (boot_tel.boot_stage < 5 || rex::IsAppBackgroundPaused() ||
       g_locate_state.active.load(std::memory_order_acquire)) {
     s_initialized = false;
+    s_has_cached_cp = false;
     s_logged_hang = false;
     g_guest_hang_detected.store(false, std::memory_order_relaxed);
+    g_hang_is_gpu_stall.store(false, std::memory_order_relaxed);
     return;
   }
 
   const uint64_t cur_hook = g_hook_total_calls.load(std::memory_order_relaxed);
   const uint64_t cur_vdswap = boot_tel.vd_swaps;
-  if (!s_initialized || cur_hook != s_prev_hook || cur_vdswap != s_prev_vdswap) {
+  if (!s_initialized) {
     s_initialized = true;
     s_prev_hook = cur_hook;
     s_prev_vdswap = cur_vdswap;
     s_last_progress_ms = now_ms;
+    s_vdswap_at_gpu_progress = cur_vdswap;
+    s_last_gpu_progress_ms = now_ms;
     s_logged_hang = false;
     g_guest_hang_detected.store(false, std::memory_order_relaxed);
+    g_hang_is_gpu_stall.store(false, std::memory_order_relaxed);
     return;
   }
 
-  const int64_t stall_ms = now_ms - s_last_progress_ms;
-  if (stall_ms >= 2500) {
+  if (cur_hook != s_prev_hook || cur_vdswap != s_prev_vdswap) {
+    s_prev_hook = cur_hook;
+    s_prev_vdswap = cur_vdswap;
+    s_last_progress_ms = now_ms;
+  }
+
+  bool gpu_stall = false;
+  int64_t gpu_stall_ms = 0;
+#ifdef _WIN32
+  if ((now_ms - s_last_cp_poll_ms) >= 100 || !s_has_cached_cp) {
+    s_last_cp_poll_ms = now_ms;
+    if (auto* rt = rex::Runtime::instance()) {
+      if (auto* gs = rt->graphics_system()) {
+        s_has_cached_cp = gs->GetCommandProcessorHangState(s_cached_cp);
+      }
+    }
+  }
+  if (s_has_cached_cp) {
+    const uint64_t cur_gpuswap = s_cached_cp.refresh_guest_output_count;
+    if (cur_gpuswap != s_prev_gpuswap || cur_vdswap == s_vdswap_at_gpu_progress) {
+      s_prev_gpuswap = cur_gpuswap;
+      s_vdswap_at_gpu_progress = cur_vdswap;
+      s_last_gpu_progress_ms = now_ms;
+    } else {
+      gpu_stall_ms = now_ms - s_last_gpu_progress_ms;
+      gpu_stall = (gpu_stall_ms >= 2500);
+    }
+  }
+#endif
+
+  const int64_t guest_stall_ms = now_ms - s_last_progress_ms;
+  const bool guest_stall = (guest_stall_ms >= 2500);
+  if (!guest_stall && !gpu_stall) {
+    s_logged_hang = false;
+    g_guest_hang_detected.store(false, std::memory_order_relaxed);
+    g_hang_is_gpu_stall.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  if (guest_stall) {
     const char* state_name = rex::GetGuestThreadStateName(boot_tel.guest_state);
     const char* stage = g_main_xthread_stage.load(std::memory_order_acquire);
     {
@@ -3259,10 +3356,28 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
       std::snprintf(g_hang_hud_state, sizeof(g_hang_hud_state), "%s%s [%s]", state_name,
                     boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "guest");
     }
+    g_hang_is_gpu_stall.store(false, std::memory_order_relaxed);
     g_guest_hang_detected.store(true, std::memory_order_release);
     if (!s_logged_hang) {
       s_logged_hang = true;
-      WriteGuestHangLog(boot_tel, static_cast<uint64_t>(stall_ms), cur_hook);
+      WriteGuestHangLog(boot_tel, static_cast<uint64_t>(guest_stall_ms), cur_hook, false);
+    }
+  } else {
+    {
+      std::lock_guard<std::mutex> lock(g_hang_hud_mutex);
+      std::snprintf(g_hang_hud_state, sizeof(g_hang_hud_state),
+                    "Stage=%s rd=0x%X wr=0x%X sub=%llu/%llu hr=0x%08X",
+                    s_cached_cp.worker_stage ? s_cached_cp.worker_stage : "?",
+                    s_cached_cp.read_ptr, s_cached_cp.write_ptr,
+                    static_cast<unsigned long long>(s_cached_cp.submission_current),
+                    static_cast<unsigned long long>(s_cached_cp.submission_completed),
+                    s_cached_cp.device_removed_reason);
+    }
+    g_hang_is_gpu_stall.store(true, std::memory_order_relaxed);
+    g_guest_hang_detected.store(true, std::memory_order_release);
+    if (!s_logged_hang) {
+      s_logged_hang = true;
+      WriteGuestHangLog(boot_tel, static_cast<uint64_t>(gpu_stall_ms), cur_hook, true);
     }
   }
 }
@@ -3667,6 +3782,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
 
       const char* boot_stage_name = rex::GetBootStageName(boot_tel.boot_stage);
       const bool hang_active = g_guest_hang_detected.load(std::memory_order_acquire);
+      const bool hang_is_gpu_stall = g_hang_is_gpu_stall.load(std::memory_order_acquire);
       char hang_hud_buf[96]{};
       if (hang_active) {
         std::lock_guard<std::mutex> lock(g_hang_hud_mutex);
@@ -3745,7 +3861,8 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         draw_fault_lines(false);
         if (hang_active) {
           ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
-                             "HANG:      %s (see peggle2_hang.log)",
+                             hang_is_gpu_stall ? "GPU STALL: %s (see peggle2_hang.log)"
+                                               : "HANG:      %s (see peggle2_hang.log)",
                              hang_hud_buf[0] ? hang_hud_buf : "stalled");
         }
         ImGui::Text("GuestGPU:  PM4Packets=%llu | Draws=%llu | Shaders=%llu | VdSwaps=%llu",
@@ -3775,7 +3892,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     g_telemetry_host_p99_ms.load(std::memory_order_relaxed),
                     g_telemetry_host_max_ms.load(std::memory_order_relaxed));
         ImGui::Text("Rendered FPS:   %.1f (%.2f ms)", ren_fps, ren_ms);
-        const bool guest_stalled = hang_active || sim_fps <= 0.1f;
+        const bool guest_stalled = (hang_active && !hang_is_gpu_stall) || sim_fps <= 0.1f;
         const bool guest_ok = !guest_stalled && (sim_fps >= 57.0f && sim_fps <= 63.0f);
         const ImVec4 guest_col = guest_stalled
                                      ? ImVec4(1.0f, 0.25f, 0.25f, 1.0f)
@@ -3785,9 +3902,10 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         ImGui::Text("Guest Logic:    %.1f FPS (%.2fx speed)", sim_fps, speed);
         ImGui::PopStyleColor();
 #if !REX_PLATFORM_IOS
-        ImGui::Text("Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s",
+        ImGui::Text("Rates: Hook=%u VdSwap=%u GpuSwap=%u VBlank=%u Present=%u Build=%s",
                     g_rate_hook_hz.load(std::memory_order_relaxed),
                     g_rate_vdswap_hz.load(std::memory_order_relaxed),
+                    g_rate_gpuswap_hz.load(std::memory_order_relaxed),
                     g_rate_vblank_hz.load(std::memory_order_relaxed),
                     g_rate_present_hz.load(std::memory_order_relaxed),
                     GetAppBuildSha());
@@ -3838,7 +3956,8 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     static_cast<unsigned long long>(boot_tel.vblanks));
         draw_fault_lines(true);
         if (hang_active) {
-          ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "HANG: %s",
+          ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
+                             hang_is_gpu_stall ? "GPU STALL: %s" : "HANG: %s",
                              hang_hud_buf[0] ? hang_hud_buf : "stalled");
         }
         ImGui::Text("GuestGPU: PM4=%llu Draws=%llu Shaders=%llu VdSwaps=%llu | VFS: OK=%u Fail=%u Last=%s",
@@ -3857,9 +3976,10 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     (int)g_telemetry_stick_lx.load(std::memory_order_relaxed), rec_tag);
         draw_perf_line(true);
 #if !REX_PLATFORM_IOS
-        ImGui::Text("Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s",
+        ImGui::Text("Rates: Hook=%u VdSwap=%u GpuSwap=%u VBlank=%u Present=%u Build=%s",
                     g_rate_hook_hz.load(std::memory_order_relaxed),
                     g_rate_vdswap_hz.load(std::memory_order_relaxed),
+                    g_rate_gpuswap_hz.load(std::memory_order_relaxed),
                     g_rate_vblank_hz.load(std::memory_order_relaxed),
                     g_rate_present_hz.load(std::memory_order_relaxed),
                     GetAppBuildSha());
@@ -4564,11 +4684,25 @@ static std::thread g_cadence_reporter([] {
     const uint32_t vblank_hz = static_cast<uint32_t>(cur_vblank - last_vblank_count);
     last_vblank_count = cur_vblank;
 
+    static uint64_t last_gpuswap_count = 0;
+    uint64_t cur_gpuswap = 0;
+    if (auto* rt = rex::Runtime::instance()) {
+      if (auto* gs = rt->graphics_system()) {
+        rex::system::CommandProcessorHangState cp{};
+        if (gs->GetCommandProcessorHangState(cp)) {
+          cur_gpuswap = cp.refresh_guest_output_count;
+        }
+      }
+    }
+    const uint32_t gpuswap_hz = static_cast<uint32_t>(cur_gpuswap - last_gpuswap_count);
+    last_gpuswap_count = cur_gpuswap;
+
     uint32_t f2 = g_f2c8_updates.exchange(0);
     uint32_t hook_hz = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
     uint32_t guest_fps_val = (f2 > 0) ? f2 : hook_hz;
     g_rate_hook_hz.store(hook_hz, std::memory_order_relaxed);
     g_rate_vdswap_hz.store(vdswap_hz, std::memory_order_relaxed);
+    g_rate_gpuswap_hz.store(gpuswap_hz, std::memory_order_relaxed);
     g_rate_vblank_hz.store(vblank_hz, std::memory_order_relaxed);
     g_rate_present_hz.store(host, std::memory_order_relaxed);
     g_telemetry_rendered_fps.store((float)ren, std::memory_order_relaxed);
@@ -4590,13 +4724,13 @@ static std::thread g_cadence_reporter([] {
     const bool has_pm = rex::ui::Presenter::GetActiveProfilingHudMetrics(pm);
     int fps_idx = g_target_fps_index.load(std::memory_order_relaxed);
     float speed = (guest_fps_val > 0) ? ((float)guest_fps_val / 60.0f) : 1.00f;
-    printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Rates: Hook=%u VdSwap=%u VBlank=%u Present=%u Build=%s | "
+    printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Rates: Hook=%u VdSwap=%u GpuSwap=%u VBlank=%u Present=%u Build=%s | "
            "Rendered=%u Sim=%u (%.2fx speed) | "
            "HostFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u >33ms=%u) | "
            "GuestFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u) | "
            "Perf(cpu=%.2f pres=%.2f)\n",
            kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(),
-           hook_hz, vdswap_hz, vblank_hz, host, GetAppBuildSha(),
+           hook_hz, vdswap_hz, gpuswap_hz, vblank_hz, host, GetAppBuildSha(),
            ren, guest_fps_val, speed,
            hft.p50, hft.p95, hft.p99, hft.max, hft.over20, hft.over33,
            gft.p50, gft.p95, gft.p99, gft.max, gft.over20,
