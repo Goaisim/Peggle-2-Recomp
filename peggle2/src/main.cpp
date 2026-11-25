@@ -582,6 +582,43 @@ static int64_t AdvanceGuestHookDeadlineNs(int64_t prev_deadline_ns, int64_t wake
   return (next_dl < min_next) ? (wake_ns + kGuestHookIntervalNs) : next_dl;
 }
 
+// Advances a 60.0 Hz fixed-step accumulator after Step 1 consumes one 16.6667 ms tick.
+// Returns true only when accumulated wall time warrants executing Step 2 as a catch-up tick.
+static bool StepFixedSimAccumulator(int64_t dt_ns, int64_t& acc_ns) {
+  const int64_t clamped_dt_ns = std::clamp(dt_ns, int64_t{0}, int64_t{50'000'000LL});
+  acc_ns += clamped_dt_ns - kGuestHookIntervalNs;
+  if (acc_ns < -kGuestHookIntervalNs) {
+    acc_ns = -kGuestHookIntervalNs;
+  }
+  // 1 ms jitter margin lets a ~32.5 ms 30 Hz swap catch up while ignoring normal ~17 ms swap jitter.
+  constexpr int64_t kCatchUpThresholdNs = kGuestHookIntervalNs - 1'000'000LL;
+  if (acc_ns >= kCatchUpThresholdNs) {
+    acc_ns -= kGuestHookIntervalNs;
+    return true;
+  }
+  return false;
+}
+
+static bool PaceGuestSimSecondStep() {
+  static bool s_initialized = false;
+  static int64_t s_prev_ns = 0;
+  static int64_t s_acc_ns = 0;
+  static uint64_t s_last_bg_pause_count = 0;
+
+  const uint64_t bg_cnt = rex::GetAppBackgroundPauseCount();
+  const int64_t now_ns = MonotonicGuestClockNs();
+  if (!s_initialized || bg_cnt != s_last_bg_pause_count || (now_ns - s_prev_ns) > 250'000'000LL) {
+    s_last_bg_pause_count = bg_cnt;
+    s_prev_ns = now_ns;
+    s_acc_ns = 0;
+    s_initialized = true;
+    return false;
+  }
+  const int64_t dt_ns = now_ns - s_prev_ns;
+  s_prev_ns = now_ns;
+  return StepFixedSimAccumulator(dt_ns, s_acc_ns);
+}
+
 static float PaceGuestHook60Hz() {
   static std::mutex s_hook_pacer_mutex;
   static bool s_initialized = false;
@@ -1761,6 +1798,21 @@ static void RunColliderSelfCheck() {
               100'000'000LL + kGuestHookIntervalNs);
     TC_ASSERT(AdvanceGuestHookDeadlineNs(100'000'000LL, 120'000'000LL) ==
               120'000'000LL + kGuestHookIntervalNs);
+    {
+      int64_t acc = 0;
+      TC_ASSERT(!StepFixedSimAccumulator(kGuestHookIntervalNs, acc) && acc == 0);
+      TC_ASSERT(!StepFixedSimAccumulator(29'000'000LL, acc));
+      TC_ASSERT(!StepFixedSimAccumulator(16'666'667LL, acc));
+      acc = 0;
+      TC_ASSERT(!StepFixedSimAccumulator(25'000'000LL, acc));
+      TC_ASSERT(StepFixedSimAccumulator(25'000'000LL, acc));
+      TC_ASSERT(!StepFixedSimAccumulator(25'000'000LL, acc));
+      TC_ASSERT(StepFixedSimAccumulator(25'000'000LL, acc) && acc <= 16 && acc >= -16);
+      acc = 0;
+      TC_ASSERT(StepFixedSimAccumulator(33'333'334LL, acc) && acc == 0);
+      TC_ASSERT(StepFixedSimAccumulator(100'000'000LL, acc));
+      TC_ASSERT(acc == 50'000'000LL - 2 * kGuestHookIntervalNs);
+    }
     if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 8 (pause hover + visual turret + deadzone) passed\n");
     rex_monitor::ClearTestState();
   }
@@ -2323,6 +2375,8 @@ extern "C" uint32_t GetActiveTargetFps() {
 // ---------------------------------------------------------------------------
 // D3D Presentation Interval Hook (0x826199B0)
 // ---------------------------------------------------------------------------
+static std::atomic<bool> g_run_second_sim_step{false};
+
 extern "C" REX_FUNC(sub_826199B0) {
   REX_FUNC_PROLOGUE();
   int vsync = g_opt_vsync.load(std::memory_order_relaxed);
@@ -2542,7 +2596,6 @@ extern "C" REX_FUNC(sub_8261FE50) {
   auto now = std::chrono::steady_clock::now();
   if (s_has_prev_vdswap) {
     float elapsed_ms = std::chrono::duration<float, std::milli>(now - s_prev_vdswap).count();
-    g_vdswap_elapsed_ms.store(elapsed_ms, std::memory_order_relaxed);
     g_guest_ft_window.Push(elapsed_ms);
   }
   s_prev_vdswap = now;
@@ -2562,21 +2615,40 @@ extern "C" REX_FUNC(sub_8261FE50) {
 }
 
 // ---------------------------------------------------------------------------
-// Simulation Update Count Hook (0x8242F2C8)
+// Simulation Update Hooks (0x8242F2C8 / 0x8243CE30)
+// Retail 30 FPS console loop (sub_8242F8A8 @ 0x8242F9BC) runs two 60 Hz steps per swap;
+// at 60 Hz swaps the second step must run only as a wall-clock catch-up to keep 1.00x speed.
 // ---------------------------------------------------------------------------
 DECLARE_REX_FUNC(sub_8242F2C8);
 extern "C" REX_FUNC(sub_8242F2C8) {
   REX_FUNC_PROLOGUE();
-  g_current_frame.fetch_add(1, std::memory_order_relaxed);
-  // Peggle 2 calls sub_8242F2C8 twice per 60 Hz frame (r4=0 pre-step at 0x8242F9D4, then main update at 0x8242FA0C).
-  if (static_cast<uint32_t>(ctx.lr) != 0x8242F9D4u) {
-    g_f2c8_updates.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (lr == 0x8242F9D4u) {
+    const bool run_second = PaceGuestSimSecondStep();
+    g_run_second_sim_step.store(run_second, std::memory_order_relaxed);
+    // Drive g_vdswap_elapsed_ms too so asset-free CI builds match local regenerated builds.
+    g_vdswap_elapsed_ms.store(run_second ? 33.333f : 16.667f, std::memory_order_relaxed);
+  } else if (lr == 0x8242FA0Cu && !g_run_second_sim_step.load(std::memory_order_relaxed)) {
+    ctx.r3.u64 = 1;
+    return;
   }
+  g_current_frame.fetch_add(1, std::memory_order_relaxed);
+  g_f2c8_updates.fetch_add(1, std::memory_order_relaxed);
   rex::SetGuestLastPC(0x8242F2C8u);
-  rex::SetGuestLastLR(static_cast<uint32_t>(ctx.lr));
+  rex::SetGuestLastLR(lr);
   rex::SetGuestThreadState(1);
   rex::RecordGuestTick();
   __imp__sub_8242F2C8(ctx, base);
+}
+
+DECLARE_REX_FUNC(sub_8243CE30);
+extern "C" REX_FUNC(sub_8243CE30) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (lr == 0x8242FA34u && !g_run_second_sim_step.load(std::memory_order_relaxed)) {
+    return;
+  }
+  __imp__sub_8243CE30(ctx, base);
 }
 
 // ---------------------------------------------------------------------------
@@ -4197,7 +4269,7 @@ static std::thread g_cadence_reporter([] {
 
     uint32_t f2 = g_f2c8_updates.exchange(0);
     uint32_t hook_hz = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
-    uint32_t guest_fps_val = (hook_hz > 0) ? hook_hz : f2;
+    uint32_t guest_fps_val = (f2 > 0) ? f2 : hook_hz;
     g_rate_hook_hz.store(hook_hz, std::memory_order_relaxed);
     g_rate_vdswap_hz.store(vdswap_hz, std::memory_order_relaxed);
     g_rate_vblank_hz.store(vblank_hz, std::memory_order_relaxed);
@@ -4228,7 +4300,7 @@ static std::thread g_cadence_reporter([] {
            "Perf(cpu=%.2f pres=%.2f)\n",
            kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(),
            hook_hz, vdswap_hz, vblank_hz, host, GetAppBuildSha(),
-           ren, f2, speed,
+           ren, guest_fps_val, speed,
            hft.p50, hft.p95, hft.p99, hft.max, hft.over20, hft.over33,
            gft.p50, gft.p95, gft.p99, gft.max, gft.over20,
            has_pm ? pm.avg_cpu_ms : -1.0f, has_pm ? pm.avg_present_ms : -1.0f);
