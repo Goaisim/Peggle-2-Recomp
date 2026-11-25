@@ -38,6 +38,7 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <dbghelp.h>
 #include <shobjidl.h>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -516,11 +517,31 @@ static void ResetUserSettings() {
 
 // Telemetry Counters
 static std::atomic<uint32_t> g_vdswap_calls{0};
+static std::atomic<uint64_t> g_hook_total_calls{0};
 static std::atomic<uint32_t> g_f2c8_updates{0};
 static std::atomic<uint32_t> g_rate_hook_hz{0};
 static std::atomic<uint32_t> g_rate_vdswap_hz{0};
 static std::atomic<uint32_t> g_rate_vblank_hz{0};
 static std::atomic<uint32_t> g_rate_present_hz{0};
+static std::atomic<uint32_t> g_main_xthread_tid{0};
+static std::atomic<const char*> g_main_xthread_stage{"guest"};
+static std::atomic<bool> g_guest_hang_detected{false};
+static std::mutex g_hang_hud_mutex;
+static char g_hang_hud_state[96]{};
+
+struct ScopedMainThreadStage {
+  const char* prev;
+  explicit ScopedMainThreadStage(const char* stage)
+      : prev(g_main_xthread_stage.exchange(stage, std::memory_order_release)) {
+#ifdef _WIN32
+    if (g_main_xthread_tid.load(std::memory_order_relaxed) == 0) {
+      g_main_xthread_tid.store(static_cast<uint32_t>(GetCurrentThreadId()),
+                               std::memory_order_relaxed);
+    }
+#endif
+  }
+  ~ScopedMainThreadStage() { g_main_xthread_stage.store(prev, std::memory_order_release); }
+};
 
 #ifndef REX_BUILD_SHA
 #define REX_BUILD_SHA "unknown"
@@ -619,7 +640,12 @@ static bool PaceGuestSimSecondStep() {
   return StepFixedSimAccumulator(dt_ns, s_acc_ns);
 }
 
+static int64_t ClampGuestHookSleepNs(int64_t rem_ns) {
+  return std::clamp(rem_ns, int64_t{0}, int64_t{33'000'000LL});
+}
+
 static float PaceGuestHook60Hz() {
+  ScopedMainThreadStage stage_guard("PaceGuestHook60Hz");
   static std::mutex s_hook_pacer_mutex;
   static bool s_initialized = false;
   static int64_t s_next_deadline_ns = 0;
@@ -666,13 +692,15 @@ static float PaceGuestHook60Hz() {
   if (tls_timer.h) {
     while (true) {
       const int64_t cur_ns = MonotonicGuestClockNs();
-      const int64_t rem_ns = deadline_ns - cur_ns;
+      if (cur_ns - sleep_start_ns > 40'000'000LL) break;
+      const int64_t rem_ns = ClampGuestHookSleepNs(deadline_ns - cur_ns);
       if (rem_ns <= 0) break;
       if (rem_ns > 800'000LL) {
+        const int64_t wait_100ns = std::max<int64_t>(1000LL, (rem_ns - 600'000LL) / 100LL);
         LARGE_INTEGER due{};
-        due.QuadPart = -((rem_ns - 600'000LL) / 100LL);
+        due.QuadPart = -wait_100ns;
         if (SetWaitableTimer(tls_timer.h, &due, 0, nullptr, nullptr, FALSE)) {
-          WaitForSingleObject(tls_timer.h, INFINITE);
+          WaitForSingleObject(tls_timer.h, 35);
         } else {
           Sleep(1);
         }
@@ -1798,6 +1826,8 @@ static void RunColliderSelfCheck() {
               100'000'000LL + kGuestHookIntervalNs);
     TC_ASSERT(AdvanceGuestHookDeadlineNs(100'000'000LL, 120'000'000LL) ==
               120'000'000LL + kGuestHookIntervalNs);
+    TC_ASSERT(ClampGuestHookSleepNs(-5) == 0 &&
+              ClampGuestHookSleepNs(100'000'000LL) == 33'000'000LL);
     {
       int64_t acc = 0;
       TC_ASSERT(!StepFixedSimAccumulator(kGuestHookIntervalNs, acc) && acc == 0);
@@ -2392,6 +2422,8 @@ extern "C" REX_FUNC(sub_826199B0) {
 DECLARE_REX_FUNC(sub_8261FE50);
 extern "C" REX_FUNC(sub_8261FE50) {
   REX_FUNC_PROLOGUE();
+  ScopedMainThreadStage stage_guard("sub_8261FE50");
+  g_hook_total_calls.fetch_add(1, std::memory_order_relaxed);
 
 #ifdef _WIN32
   // Edge-detected keyboard polling for F1 and menu navigation
@@ -2622,6 +2654,8 @@ extern "C" REX_FUNC(sub_8261FE50) {
 DECLARE_REX_FUNC(sub_8242F2C8);
 extern "C" REX_FUNC(sub_8242F2C8) {
   REX_FUNC_PROLOGUE();
+  ScopedMainThreadStage stage_guard("sub_8242F2C8");
+  g_hook_total_calls.fetch_add(1, std::memory_order_relaxed);
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   if (lr == 0x8242F9D4u) {
     const bool run_second = PaceGuestSimSecondStep();
@@ -2644,8 +2678,11 @@ extern "C" REX_FUNC(sub_8242F2C8) {
 DECLARE_REX_FUNC(sub_8243CE30);
 extern "C" REX_FUNC(sub_8243CE30) {
   REX_FUNC_PROLOGUE();
+  ScopedMainThreadStage stage_guard("sub_8243CE30");
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   if (lr == 0x8242FA34u && !g_run_second_sim_step.load(std::memory_order_relaxed)) {
+    const uint32_t wm = ctx.r3.u32;
+    ctx.r3.u64 = (wm >= 0x40000000u && wm < 0x80000000u) ? REX_LOAD_U8(wm + 40) : 0;
     return;
   }
   __imp__sub_8243CE30(ctx, base);
@@ -2991,6 +3028,245 @@ static const char* MenuModeName(int mode) {
 
 static std::filesystem::path ResolveGameDataFolder(const std::filesystem::path& requested);
 
+#ifdef _WIN32
+static int CaptureWinThreadStackPcs(uint32_t tid, uint64_t* out_pcs, int max_frames) {
+  if (tid == 0 || tid == static_cast<uint32_t>(GetCurrentThreadId()) || !out_pcs || max_frames <= 0) {
+    return 0;
+  }
+  static HMODULE s_dbghelp = LoadLibraryW(L"dbghelp.dll");
+  using FnSymSetOptions = DWORD(WINAPI*)(DWORD);
+  using FnSymInit = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
+  using FnStackWalk64 = BOOL(WINAPI*)(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID,
+                                      PREAD_PROCESS_MEMORY_ROUTINE64,
+                                      PFUNCTION_TABLE_ACCESS_ROUTINE64,
+                                      PGET_MODULE_BASE_ROUTINE64,
+                                      PTRANSLATE_ADDRESS_ROUTINE64);
+  static auto pSymSetOptions = s_dbghelp ? reinterpret_cast<FnSymSetOptions>(GetProcAddress(s_dbghelp, "SymSetOptions")) : nullptr;
+  static auto pSymInitialize = s_dbghelp ? reinterpret_cast<FnSymInit>(GetProcAddress(s_dbghelp, "SymInitialize")) : nullptr;
+  static auto pStackWalk64 = s_dbghelp ? reinterpret_cast<FnStackWalk64>(GetProcAddress(s_dbghelp, "StackWalk64")) : nullptr;
+  static auto pSymFunctionTableAccess64 = s_dbghelp ? reinterpret_cast<PFUNCTION_TABLE_ACCESS_ROUTINE64>(GetProcAddress(s_dbghelp, "SymFunctionTableAccess64")) : nullptr;
+  static auto pSymGetModuleBase64 = s_dbghelp ? reinterpret_cast<PGET_MODULE_BASE_ROUTINE64>(GetProcAddress(s_dbghelp, "SymGetModuleBase64")) : nullptr;
+  static std::once_flag s_sym_once;
+  if (pSymSetOptions && pSymInitialize) {
+    std::call_once(s_sym_once, []() {
+      pSymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+      pSymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    });
+  }
+
+  HANDLE thread = OpenThread(
+      THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+  if (!thread) return 0;
+
+  // Capture raw stack frames with zero heap allocations/locks while the target thread is suspended.
+  int count = 0;
+  if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(thread, &ctx)) {
+#if defined(_M_AMD64) || defined(__x86_64__)
+      constexpr DWORD kMachine = IMAGE_FILE_MACHINE_AMD64;
+      STACKFRAME64 sf{};
+      sf.AddrPC.Mode = AddrModeFlat;
+      sf.AddrFrame.Mode = AddrModeFlat;
+      sf.AddrStack.Mode = AddrModeFlat;
+      sf.AddrPC.Offset = ctx.Rip;
+      sf.AddrFrame.Offset = ctx.Rbp;
+      sf.AddrStack.Offset = ctx.Rsp;
+      out_pcs[count++] = ctx.Rip;
+#else
+      constexpr DWORD kMachine = IMAGE_FILE_MACHINE_ARM64;
+      STACKFRAME64 sf{};
+      sf.AddrPC.Mode = AddrModeFlat;
+      sf.AddrFrame.Mode = AddrModeFlat;
+      sf.AddrStack.Mode = AddrModeFlat;
+      sf.AddrPC.Offset = ctx.Pc;
+      sf.AddrFrame.Offset = ctx.Fp;
+      sf.AddrStack.Offset = ctx.Sp;
+      out_pcs[count++] = ctx.Pc;
+#endif
+      if (pStackWalk64 && pSymFunctionTableAccess64 && pSymGetModuleBase64) {
+        const HANDLE proc = GetCurrentProcess();
+        while (count < max_frames &&
+               pStackWalk64(kMachine, proc, thread, &sf, &ctx, nullptr,
+                            pSymFunctionTableAccess64, pSymGetModuleBase64, nullptr)) {
+          if (sf.AddrPC.Offset == 0) break;
+          if (sf.AddrPC.Offset != out_pcs[0] || count > 1) {
+            out_pcs[count++] = sf.AddrPC.Offset;
+          }
+        }
+      }
+    }
+    ResumeThread(thread);
+  }
+  CloseHandle(thread);
+  return count;
+}
+
+static void WriteResolvedWinStack(FILE* f, const char* label, const uint64_t* pcs, int count) {
+  if (!f) return;
+  std::fprintf(f, "%s (%d frames):\n", label, count);
+  HMODULE dbghelp = GetModuleHandleW(L"dbghelp.dll");
+  using FnSymFromAddr = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+  auto pSymFromAddr = dbghelp ? reinterpret_cast<FnSymFromAddr>(GetProcAddress(dbghelp, "SymFromAddr")) : nullptr;
+  const HANDLE proc = GetCurrentProcess();
+  alignas(SYMBOL_INFO) unsigned char sym_buf[sizeof(SYMBOL_INFO) + 256]{};
+  auto* sym = reinterpret_cast<SYMBOL_INFO*>(sym_buf);
+  sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+  sym->MaxNameLen = 255;
+
+  for (int i = 0; i < count; ++i) {
+    const uint64_t pc = pcs[i];
+    HMODULE mod = nullptr;
+    char mod_name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(pc)), &mod) &&
+        mod) {
+      GetModuleFileNameA(mod, mod_name, sizeof(mod_name));
+      if (const char* slash = std::strrchr(mod_name, '\\')) {
+        std::memmove(mod_name, slash + 1, std::strlen(slash + 1) + 1);
+      }
+    }
+    DWORD64 disp = 0;
+    if (pSymFromAddr && pSymFromAddr(proc, pc, &disp, sym)) {
+      std::fprintf(f, "  #%02d 0x%016llX %s!%s+0x%llX\n", i, static_cast<unsigned long long>(pc),
+                   mod_name, sym->Name, static_cast<unsigned long long>(disp));
+    } else {
+      const uint64_t rel = mod ? (pc - reinterpret_cast<uintptr_t>(mod)) : pc;
+      std::fprintf(f, "  #%02d 0x%016llX %s+0x%llX\n", i, static_cast<unsigned long long>(pc),
+                   mod_name, static_cast<unsigned long long>(rel));
+    }
+  }
+}
+#endif
+
+static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uint64_t stall_ms,
+                              uint64_t total_hooks) {
+  rex::system::CommandProcessorHangState cp{};
+  bool has_cp = false;
+  if (auto* rt = rex::Runtime::instance()) {
+    if (auto* gs = rt->graphics_system()) {
+      has_cp = gs->GetCommandProcessorHangState(cp);
+    }
+  }
+
+#ifdef _WIN32
+  uint64_t main_pcs[24]{};
+  uint64_t cp_pcs[24]{};
+  const uint32_t main_tid = g_main_xthread_tid.load(std::memory_order_relaxed);
+  const uint32_t cp_tid = static_cast<uint32_t>(cp.worker_os_tid);
+  const int main_frames = CaptureWinThreadStackPcs(main_tid, main_pcs, 24);
+  const int cp_frames = (has_cp && cp_tid != 0) ? CaptureWinThreadStackPcs(cp_tid, cp_pcs, 24) : 0;
+#endif
+
+  std::filesystem::path log_path = GetExeDirectory() / "peggle2_hang.log";
+  FILE* f = nullptr;
+#ifdef _WIN32
+  _wfopen_s(&f, log_path.wstring().c_str(), L"w");
+#else
+  f = std::fopen(log_path.string().c_str(), "w");
+#endif
+  if (!f) {
+    f = std::fopen("peggle2_hang.log", "w");
+  }
+  if (!f) return;
+
+  const char* stage = g_main_xthread_stage.load(std::memory_order_acquire);
+  const char* state_name = rex::GetGuestThreadStateName(boot_tel.guest_state);
+  std::fprintf(f,
+               "Peggle 2 Guest Hang Report (Build=%s RT=%s)\n"
+               "StallMs=%llu | TotalHooks=%llu | VdSwaps=%llu | Screen=%u\n"
+               "MainXThread: State=%s%s | Stage=%s | GuestPC=0x%08X | GuestLR=0x%08X | Ticks=%llu | VBlanks=%llu\n",
+               GetAppBuildSha(), rex::GetRuntimeBuildTag(),
+               static_cast<unsigned long long>(stall_ms),
+               static_cast<unsigned long long>(total_hooks),
+               static_cast<unsigned long long>(boot_tel.vd_swaps),
+               static_cast<unsigned>(rex_monitor::GetCurrentScreenId()),
+               state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "",
+               stage ? stage : "unknown",
+               boot_tel.guest_pc, boot_tel.guest_lr,
+               static_cast<unsigned long long>(boot_tel.guest_ticks),
+               static_cast<unsigned long long>(boot_tel.vblanks));
+
+  const uint32_t total_imp = boot_tel.last_import_count;
+  const uint32_t start_imp = (total_imp > 8u) ? (total_imp - 8u) : 0u;
+  std::fprintf(f, "LastKernelImports (%u shown):\n", total_imp - start_imp);
+  for (uint32_t i = start_imp; i < total_imp; ++i) {
+    const auto& imp = boot_tel.last_imports[i];
+    std::fprintf(f, "  [%u] %s(r3=0x%08X, r4=0x%08X) -> 0x%08X\n", i - start_imp,
+                 imp.name ? imp.name : "?", imp.r3, imp.r4, imp.return_value);
+  }
+
+  if (has_cp) {
+    std::fprintf(f,
+                 "CommandProcessor: Stage=%s | read_ptr=0x%X | write_ptr=0x%X | paused=%d | "
+                 "frame_open=%d | in_wait_reg_mem=%d (addr=0x%08X) | in_readback=%d | pending_fns=%u\n",
+                 cp.worker_stage ? cp.worker_stage : "?",
+                 cp.read_ptr, cp.write_ptr, cp.paused ? 1 : 0, cp.frame_open ? 1 : 0,
+                 cp.in_wait_reg_mem ? 1 : 0, cp.wait_reg_addr, cp.in_readback ? 1 : 0,
+                 cp.pending_fns_count);
+  }
+
+#ifdef _WIN32
+  WriteResolvedWinStack(f, "Main XThread Stack", main_pcs, main_frames);
+  WriteResolvedWinStack(f, "CommandProcessor::WorkerThreadMain Stack", cp_pcs, cp_frames);
+#endif
+  std::fflush(f);
+  std::fclose(f);
+  std::printf("[WATCHDOG] Guest hang (>%llums) logged to %s | State=%s%s [%s]\n",
+              static_cast<unsigned long long>(stall_ms), log_path.string().c_str(),
+              state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "unknown");
+  std::fflush(stdout);
+}
+
+static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_tel) {
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  static bool s_initialized = false;
+  static uint64_t s_prev_hook = 0;
+  static uint64_t s_prev_vdswap = 0;
+  static int64_t s_last_progress_ms = 0;
+  static bool s_logged_hang = false;
+
+  if (boot_tel.boot_stage < 5 || rex::IsAppBackgroundPaused() ||
+      g_locate_state.active.load(std::memory_order_acquire)) {
+    s_initialized = false;
+    s_logged_hang = false;
+    g_guest_hang_detected.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  const uint64_t cur_hook = g_hook_total_calls.load(std::memory_order_relaxed);
+  const uint64_t cur_vdswap = boot_tel.vd_swaps;
+  if (!s_initialized || cur_hook != s_prev_hook || cur_vdswap != s_prev_vdswap) {
+    s_initialized = true;
+    s_prev_hook = cur_hook;
+    s_prev_vdswap = cur_vdswap;
+    s_last_progress_ms = now_ms;
+    s_logged_hang = false;
+    g_guest_hang_detected.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  const int64_t stall_ms = now_ms - s_last_progress_ms;
+  if (stall_ms >= 2500) {
+    const char* state_name = rex::GetGuestThreadStateName(boot_tel.guest_state);
+    const char* stage = g_main_xthread_stage.load(std::memory_order_acquire);
+    {
+      std::lock_guard<std::mutex> lock(g_hang_hud_mutex);
+      std::snprintf(g_hang_hud_state, sizeof(g_hang_hud_state), "%s%s [%s]", state_name,
+                    boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "guest");
+    }
+    g_guest_hang_detected.store(true, std::memory_order_release);
+    if (!s_logged_hang) {
+      s_logged_hang = true;
+      WriteGuestHangLog(boot_tel, static_cast<uint64_t>(stall_ms), cur_hook);
+    }
+  }
+}
+
 class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
  public:
   explicit ReXGlueSettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer)
@@ -3015,11 +3291,13 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
     s_prev_host = now;
     s_has_prev_host = true;
 
+    const rex::RexBootTelemetrySnapshot boot_tel = rex::GetBootTelemetrySnapshot();
+    UpdateGuestHangWatchdog(boot_tel);
+
     if (g_opt_ui_colliders.load(std::memory_order_relaxed) == kCollidersOn) {
       DrawUiColliderOverlay(io);
     }
     if (g_opt_hud.load(std::memory_order_relaxed) != kHudHidden) {
-      const rex::RexBootTelemetrySnapshot boot_tel = rex::GetBootTelemetrySnapshot();
       const char* crash_sym = UpdateCrashDiagnostics(boot_tel);
       DrawTelemetryHud(io, boot_tel, crash_sym);
     }
@@ -3388,6 +3666,12 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
       else snprintf(rgb_buf, sizeof(rgb_buf), "---,---,---");
 
       const char* boot_stage_name = rex::GetBootStageName(boot_tel.boot_stage);
+      const bool hang_active = g_guest_hang_detected.load(std::memory_order_acquire);
+      char hang_hud_buf[96]{};
+      if (hang_active) {
+        std::lock_guard<std::mutex> lock(g_hang_hud_mutex);
+        std::snprintf(hang_hud_buf, sizeof(hang_hud_buf), "%s", g_hang_hud_state);
+      }
       auto draw_fault_lines = [&](bool compact) {
         if (boot_tel.fault_signal == 0 && boot_tel.fault_addr == 0) return;
 #if REX_PLATFORM_IOS
@@ -3459,6 +3743,11 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     boot_tel.gpu_fence_wait ? "+GPUWait" : "",
                     static_cast<unsigned long long>(boot_tel.vblanks));
         draw_fault_lines(false);
+        if (hang_active) {
+          ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
+                             "HANG:      %s (see peggle2_hang.log)",
+                             hang_hud_buf[0] ? hang_hud_buf : "stalled");
+        }
         ImGui::Text("GuestGPU:  PM4Packets=%llu | Draws=%llu | Shaders=%llu | VdSwaps=%llu",
                     static_cast<unsigned long long>(boot_tel.pm4_packets),
                     static_cast<unsigned long long>(boot_tel.guest_draws),
@@ -3486,9 +3775,13 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     g_telemetry_host_p99_ms.load(std::memory_order_relaxed),
                     g_telemetry_host_max_ms.load(std::memory_order_relaxed));
         ImGui::Text("Rendered FPS:   %.1f (%.2f ms)", ren_fps, ren_ms);
-        const bool guest_ok = (sim_fps >= 57.0f && sim_fps <= 63.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              guest_ok ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.9f, 0.2f, 1.0f));
+        const bool guest_stalled = hang_active || sim_fps <= 0.1f;
+        const bool guest_ok = !guest_stalled && (sim_fps >= 57.0f && sim_fps <= 63.0f);
+        const ImVec4 guest_col = guest_stalled
+                                     ? ImVec4(1.0f, 0.25f, 0.25f, 1.0f)
+                                     : (guest_ok ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
+                                                 : ImVec4(1.0f, 0.9f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, guest_col);
         ImGui::Text("Guest Logic:    %.1f FPS (%.2fx speed)", sim_fps, speed);
         ImGui::PopStyleColor();
 #if !REX_PLATFORM_IOS
@@ -3544,6 +3837,10 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     boot_tel.gpu_fence_wait ? "+GPUWait" : "",
                     static_cast<unsigned long long>(boot_tel.vblanks));
         draw_fault_lines(true);
+        if (hang_active) {
+          ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "HANG: %s",
+                             hang_hud_buf[0] ? hang_hud_buf : "stalled");
+        }
         ImGui::Text("GuestGPU: PM4=%llu Draws=%llu Shaders=%llu VdSwaps=%llu | VFS: OK=%u Fail=%u Last=%s",
                     static_cast<unsigned long long>(boot_tel.pm4_packets),
                     static_cast<unsigned long long>(boot_tel.guest_draws),
@@ -4391,6 +4688,7 @@ DECLARE_REX_FUNC(sub_8223BD10);
 DECLARE_REX_FUNC(sub_821A7398);
 extern "C" REX_FUNC(sub_8223BD10) {
   REX_FUNC_PROLOGUE();
+  ScopedMainThreadStage stage_guard("sub_8223BD10");
   uint32_t board_obj = ctx.r3.u32;
   g_last_board_obj.store(board_obj, std::memory_order_relaxed);
   g_guest_gameplay_frame_tick.store(
@@ -4429,7 +4727,7 @@ extern "C" REX_FUNC(sub_8223BD10) {
     float target_y = std::cos(angle);
     uint32_t saved_r1 = ctx.r1.u32;
     uint32_t vec_ptr = saved_r1 - 16;
-    ctx.r1.u32 = saved_r1 - 64;
+    ctx.r1.u32 = saved_r1 - 128;
     REX_STORE_U32(vec_ptr + 0, std::bit_cast<uint32_t>(target_x));
     REX_STORE_U32(vec_ptr + 4, std::bit_cast<uint32_t>(target_y));
     ctx.r3.u64 = gun_ptr;
@@ -4608,6 +4906,7 @@ static std::thread g_mouse_hook_thread([] {
 
 extern "C" REX_FUNC(sub_8260D410) {
   REX_FUNC_PROLOGUE();
+  ScopedMainThreadStage stage_guard("sub_8260D410");
   uint32_t user_index = ctx.r3.u32;
   uint32_t state_ptr = ctx.r4.u32;
   __imp__sub_8260D410(ctx, base);

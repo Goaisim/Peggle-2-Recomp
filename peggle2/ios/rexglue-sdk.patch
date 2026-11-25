@@ -494,7 +494,7 @@ index c19caea..6b94cf4 100644
  #if REX_ARCH_AMD64
  // Raw clock source requires platform-specific implementation
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index da8e432..4507adf 100644
+index da8e432..282f881 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -12,6 +12,7 @@
@@ -505,7 +505,15 @@ index da8e432..4507adf 100644
  #include <cstring>
  #include <functional>
  #include <memory>
-@@ -36,6 +37,8 @@ class ByteStream;
+@@ -26,6 +27,7 @@
+ #include <rex/graphics/xenos.h>
+ #include <rex/memory.h>
+ #include <rex/memory/ring_buffer.h>
++#include <rex/system/interfaces/graphics.h>
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ #include <rex/ui/presenter.h>
+@@ -36,6 +38,8 @@ class ByteStream;
  
  namespace rex::graphics {
  
@@ -514,7 +522,7 @@ index da8e432..4507adf 100644
  class GraphicsSystem;
  class Shader;
  
-@@ -87,6 +90,31 @@ class CommandProcessor {
+@@ -87,6 +91,31 @@ class CommandProcessor {
    uint32_t counter() const { return counter_; }
    void increment_counter() { counter_++; }
  
@@ -546,7 +554,7 @@ index da8e432..4507adf 100644
    Shader* active_vertex_shader() const { return active_vertex_shader_; }
    Shader* active_pixel_shader() const { return active_pixel_shader_; }
  
-@@ -97,6 +125,9 @@ class CommandProcessor {
+@@ -97,6 +126,9 @@ class CommandProcessor {
  
    virtual void ClearCaches();
    virtual void InvalidateGpuMemory();
@@ -556,7 +564,15 @@ index da8e432..4507adf 100644
  
    // "Desired" is for the external thread managing the post-processing effect.
    SwapPostEffect GetDesiredSwapPostEffect() const { return swap_post_effect_desired_; }
-@@ -230,20 +261,52 @@ class CommandProcessor {
+@@ -117,6 +149,7 @@ class CommandProcessor {
+ 
+   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
+   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
++  void GetHangState(system::CommandProcessorHangState& out_state) const;
+ 
+   void UpdateWritePointer(uint32_t value);
+ 
+@@ -230,20 +263,85 @@ class CommandProcessor {
    // Shared memexport readback enable state with backend legacy-flag override support.
    bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
  
@@ -582,15 +598,48 @@ index da8e432..4507adf 100644
    RegisterFile* register_file_ = nullptr;
  
 +  bool HasPendingFns() const {
-+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
-+    return !pending_fns_.empty();
++    return pending_fns_count_.load(std::memory_order_acquire) != 0;
 +  }
++
++  void SetWorkerStage(const char* stage) {
++    worker_stage_.store(stage ? stage : "unknown", std::memory_order_release);
++  }
++  void SetFrameOpenTelemetry(bool open) {
++    frame_open_telemetry_.store(open, std::memory_order_release);
++  }
++  void SetInReadbackTelemetry(bool active) {
++    in_readback_.store(active, std::memory_order_release);
++    if (active) {
++      SetWorkerStage("readback");
++    }
++  }
++  void SetWaitRegMemTelemetry(bool active, uint32_t addr = 0) {
++    wait_reg_addr_.store(addr, std::memory_order_release);
++    in_wait_reg_mem_.store(active, std::memory_order_release);
++    if (active) {
++      SetWorkerStage("wait_reg_mem");
++    }
++  }
++  struct ScopedReadbackTelemetry {
++    CommandProcessor& cp;
++    explicit ScopedReadbackTelemetry(CommandProcessor& processor) : cp(processor) {
++      cp.SetInReadbackTelemetry(true);
++    }
++    ~ScopedReadbackTelemetry() { cp.SetInReadbackTelemetry(false); }
++  };
 +
    std::atomic<bool> worker_running_;
    system::object_ref<system::XHostThread> worker_thread_;
  
 +  mutable std::mutex pending_fns_mutex_;
    std::queue<std::function<void()>> pending_fns_;
++  std::atomic<uint32_t> pending_fns_count_{0};
++  std::atomic<bool> in_wait_reg_mem_{false};
++  std::atomic<uint32_t> wait_reg_addr_{0};
++  std::atomic<bool> in_readback_{false};
++  std::atomic<bool> frame_open_telemetry_{false};
++  std::atomic<uint64_t> worker_os_tid_{0};
++  std::atomic<const char*> worker_stage_{"init"};
  
    // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
@@ -609,7 +658,7 @@ index da8e432..4507adf 100644
  
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
-@@ -276,6 +339,12 @@ class CommandProcessor {
+@@ -276,6 +374,12 @@ class CommandProcessor {
    // Set by backend command processors to their legacy memexport readback cvar
    // name (for explicit-override compatibility).
    const char* legacy_readback_memexport_cvar_name_ = nullptr;
@@ -949,7 +998,7 @@ index 2cf24c4..16a4341 100644
  
  // GPU Primitive Processing
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
-index ac6b056..36b51c6 100644
+index ac6b056..5573e69 100644
 --- a/include/rex/graphics/graphics_system.h
 +++ b/include/rex/graphics/graphics_system.h
 @@ -14,6 +14,8 @@
@@ -961,15 +1010,16 @@ index ac6b056..36b51c6 100644
  #include <cstdint>
  #include <functional>
  #include <memory>
-@@ -79,6 +81,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
+@@ -79,6 +81,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
  
    virtual void ClearCaches();
    virtual void InvalidateGpuMemory();
 +  bool ReinitializeBackendContext() override;
++  bool GetCommandProcessorHangState(system::CommandProcessorHangState& out_state) const override;
  
    void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                 bool blocking) override;
-@@ -106,7 +109,16 @@ class GraphicsSystem : public system::IGraphicsSystem {
+@@ -106,7 +110,16 @@ class GraphicsSystem : public system::IGraphicsSystem {
    uint32_t ReadRegister(uint32_t addr);
    void WriteRegister(uint32_t addr, uint32_t value);
  
@@ -987,7 +1037,7 @@ index ac6b056..36b51c6 100644
  
    memory::Memory* memory_ = nullptr;
    runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
-@@ -118,7 +130,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
+@@ -118,7 +131,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
    uint32_t interrupt_callback_ = 0;
    uint32_t interrupt_callback_data_ = 0;
  
@@ -1845,10 +1895,30 @@ index cc92f76..61b4982 100644
  }
  
 diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
-index d54df86..b22c034 100644
+index d54df86..19da391 100644
 --- a/include/rex/system/interfaces/graphics.h
 +++ b/include/rex/system/interfaces/graphics.h
-@@ -58,6 +58,15 @@ class IGraphicsSystem {
+@@ -31,6 +31,19 @@ class KernelState;
+ 
+ namespace rex::system {
+ 
++struct CommandProcessorHangState {
++  uint32_t read_ptr = 0;
++  uint32_t write_ptr = 0;
++  bool paused = false;
++  bool frame_open = false;
++  bool in_wait_reg_mem = false;
++  bool in_readback = false;
++  uint32_t wait_reg_addr = 0;
++  uint32_t pending_fns_count = 0;
++  uint64_t worker_os_tid = 0;
++  const char* worker_stage = "init";
++};
++
+ class IGraphicsSystem {
+  public:
+   virtual ~IGraphicsSystem() = default;
+@@ -58,6 +71,19 @@ class IGraphicsSystem {
    virtual ui::Presenter* presenter() const { return nullptr; }
  
    // Guest GPU services reached from the xboxkrnl Vd* exports.
@@ -1861,6 +1931,10 @@ index d54df86..b22c034 100644
 +  virtual uint32_t last_frame_vertex_uploads() const { return 0; }
 +  virtual float last_frame_gpu_render_ms() const { return 0.0f; }
 +  virtual bool ReinitializeBackendContext() { return true; }
++  virtual bool GetCommandProcessorHangState(CommandProcessorHangState& out_state) const {
++    (void)out_state;
++    return false;
++  }
    virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
      (void)callback;
      (void)user_data;
@@ -1891,10 +1965,43 @@ index a1b4443..01b54ec 100644
    object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
    int Shutdown(int how);
 diff --git a/include/rex/thread.h b/include/rex/thread.h
-index 30b207d..e91b93e 100644
+index 30b207d..88ff3be 100644
 --- a/include/rex/thread.h
 +++ b/include/rex/thread.h
-@@ -438,6 +438,9 @@ class Thread : public WaitHandle {
+@@ -74,6 +74,32 @@ class Fence {
+     }
+   }
+ 
++  // Bounded wait variant; caller must ensure Fence outlives the signaler if timed out.
++  bool WaitFor(std::chrono::milliseconds timeout) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    assert_true((signal_state_.load() & ~SIGMASK_) < (SIGMASK_ - 1) && "Too many threads?");
++
++    auto signal_state = signal_state_.fetch_add(1) + 1;
++    if (!(signal_state & SIGMASK_)) {
++      const auto deadline = std::chrono::steady_clock::now() + timeout;
++      while (!((signal_state = signal_state_.load()) & SIGMASK_)) {
++        if (cond_.wait_until(lock, deadline) == std::cv_status::timeout) {
++          signal_state = signal_state_.load();
++          break;
++        }
++      }
++    }
++
++    const bool signaled = (signal_state & SIGMASK_) != 0;
++    assert_true((signal_state & ~SIGMASK_) > 0);
++    if (signaled && signal_state == (1 | SIGMASK_)) {
++      signal_state_.store(0, std::memory_order_release);
++    } else {
++      signal_state_.store(signal_state - 1, std::memory_order_release);
++    }
++    return signaled;
++  }
++
+  private:
+   using state_t_ = uint_fast32_t;
+   static constexpr state_t_ SIGMASK_ = state_t_(1) << (sizeof(state_t_) * 8 - 1);
+@@ -438,6 +464,9 @@ class Thread : public WaitHandle {
    // process of a thread.
    virtual void set_affinity_mask(uint64_t new_affinity_mask) = 0;
  
@@ -6712,7 +6819,7 @@ index 0d8f8af..25ca632 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..0eb241c 100644
+index a744375..2edab1f 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,11 +10,16 @@
@@ -6761,7 +6868,7 @@ index a744375..0eb241c 100644
  using namespace rex::graphics::xenos;
  
  namespace {
-@@ -143,25 +156,44 @@ bool CommandProcessor::Initialize() {
+@@ -143,25 +156,45 @@ bool CommandProcessor::Initialize() {
        }));
    worker_thread_->set_name("GPU Commands");
    worker_thread_->Create();
@@ -6799,6 +6906,7 @@ index a744375..0eb241c 100644
 +      run_inline = true;
 +    } else {
 +      pending_fns_.push(std::move(fn));
++      pending_fns_count_.store(uint32_t(pending_fns_.size()), std::memory_order_relaxed);
 +    }
 +  }
 +  if (run_inline) {
@@ -6810,13 +6918,15 @@ index a744375..0eb241c 100644
    }
  }
  
-@@ -198,15 +230,31 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+@@ -198,48 +231,88 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
  }
  
  void CommandProcessor::WorkerThreadMain() {
 +#if defined(__APPLE__)
 +  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 +#endif
++  worker_os_tid_.store(rex::thread::current_thread_system_id(), std::memory_order_relaxed);
++  SetWorkerStage("setup");
    if (!SetupContext()) {
      rex::FatalError("Unable to setup command processor internal state");
      return;
@@ -6827,31 +6937,37 @@ index a744375..0eb241c 100644
 -      auto fn = std::move(pending_fns_.front());
 -      pending_fns_.pop();
 +    if (rex::IsAppBackgroundPaused()) {
++      SetWorkerStage("bg_paused");
 +      PrepareForWait();
 +      rex::WaitWhileAppBackgroundPaused();
 +      continue;
 +    }
 +
++    SetWorkerStage("pending_fns");
 +    for (;;) {
 +      std::function<void()> fn;
 +      {
 +        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
 +        if (pending_fns_.empty()) {
++          pending_fns_count_.store(0, std::memory_order_relaxed);
 +          break;
 +        }
 +        fn = std::move(pending_fns_.front());
 +        pending_fns_.pop();
++        pending_fns_count_.store(uint32_t(pending_fns_.size()), std::memory_order_relaxed);
 +      }
        fn();
      }
  
-@@ -214,32 +262,51 @@ void CommandProcessor::WorkerThreadMain() {
+-    uint32_t write_ptr_index = write_ptr_index_.load();
++    uint32_t write_ptr_index = write_ptr_index_.load(std::memory_order_acquire);
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
-       // We've run out of commands to execute.
+-      // We've run out of commands to execute.
 -      // We spin here waiting for new ones, as the overhead of waiting on our
 -      // event is too high.
-+      // Block cleanly on Apple instead of burning a tight sched_yield spin loop.
++      SetWorkerStage("idle_wait");
++      // Bounded <=2 ms waits prevent permanent lost-wakeup stalls if UpdateWritePointer races.
        PrepareForWait();
 +#if defined(__APPLE__)
 +      do {
@@ -6859,19 +6975,20 @@ index a744375..0eb241c 100644
 +          break;
 +        }
 +        rex::thread::Wait(write_ptr_index_event_.get(), true,
-+                          std::chrono::milliseconds(5));
-+        write_ptr_index = write_ptr_index_.load();
++                          std::chrono::milliseconds(2));
++        write_ptr_index = write_ptr_index_.load(std::memory_order_acquire);
 +      } while (worker_running_ && !HasPendingFns() &&
 +               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
 +#else
        uint32_t loop_count = 0;
        do {
-         // If we spin around too much, revert to a "low-power" state.
+-        // If we spin around too much, revert to a "low-power" state.
 -        if (loop_count > 500) {
+-          const int wait_time_ms = 5;
 +        if (loop_count > 64) {
-           const int wait_time_ms = 5;
            rex::thread::Wait(write_ptr_index_event_.get(), true,
-                             std::chrono::milliseconds(wait_time_ms));
+-                            std::chrono::milliseconds(wait_time_ms));
++                            std::chrono::milliseconds(2));
 +        } else {
 +#if defined(_M_AMD64) || defined(__x86_64__)
 +          _mm_pause();
@@ -6880,8 +6997,9 @@ index a744375..0eb241c 100644
  
          rex::thread::MaybeYield();
          loop_count++;
-         write_ptr_index = write_ptr_index_.load();
+-        write_ptr_index = write_ptr_index_.load();
 -      } while (worker_running_ && pending_fns_.empty() &&
++        write_ptr_index = write_ptr_index_.load(std::memory_order_acquire);
 +      } while (worker_running_ && !HasPendingFns() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
 +#endif
@@ -6894,6 +7012,7 @@ index a744375..0eb241c 100644
      assert_true(read_ptr_index_ != write_ptr_index);
  
      // Execute. Note that we handle wraparound transparently.
++    SetWorkerStage("exec_pm4");
 +    in_exec_batch_ = true;
 +    exec_batch_start_ = std::chrono::steady_clock::now();
      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
@@ -6902,7 +7021,61 @@ index a744375..0eb241c 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -363,6 +430,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -252,6 +325,7 @@ void CommandProcessor::WorkerThreadMain() {
+     // but no games seem to actually use it.
+   }
+ 
++  SetWorkerStage("shutdown");
+   ShutdownContext();
+ }
+ 
+@@ -261,13 +335,15 @@ void CommandProcessor::Pause() {
+   }
+   paused_ = true;
+ 
+-  thread::Fence fence;
+-  CallInThread([&fence]() {
+-    fence.Signal();
++  auto fence = std::make_shared<thread::Fence>();
++  CallInThread([fence]() {
++    fence->Signal();
+     thread::Thread::GetCurrentThread()->Suspend();
+   });
+ 
+-  fence.Wait();
++  if (!fence->WaitFor(std::chrono::milliseconds(2000))) {
++    REXGPU_ERROR("CommandProcessor::Pause timed out waiting for worker thread");
++  }
+ }
+ 
+ void CommandProcessor::Resume() {
+@@ -328,10 +404,24 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+ }
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+-  write_ptr_index_ = value;
++  write_ptr_index_.store(value, std::memory_order_release);
++  std::atomic_thread_fence(std::memory_order_seq_cst);
+   write_ptr_index_event_->Set();
+ }
+ 
++void CommandProcessor::GetHangState(system::CommandProcessorHangState& out_state) const {
++  out_state.read_ptr = read_ptr_index_;
++  out_state.write_ptr = write_ptr_index_.load(std::memory_order_acquire);
++  out_state.paused = paused_;
++  out_state.frame_open = frame_open_telemetry_.load(std::memory_order_acquire);
++  out_state.in_wait_reg_mem = in_wait_reg_mem_.load(std::memory_order_acquire);
++  out_state.in_readback = in_readback_.load(std::memory_order_acquire);
++  out_state.wait_reg_addr = wait_reg_addr_.load(std::memory_order_acquire);
++  out_state.pending_fns_count = pending_fns_count_.load(std::memory_order_acquire);
++  out_state.worker_os_tid = worker_os_tid_.load(std::memory_order_acquire);
++  out_state.worker_stage = worker_stage_.load(std::memory_order_acquire);
++}
++
+ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+   if (index < RegisterFile::kRegisterCount) {
+     return register_file_->values[index];
+@@ -363,6 +453,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
    if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
      uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
      if ((1 << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
@@ -6912,7 +7085,7 @@ index a744375..0eb241c 100644
        // Enabled - write to address.
        uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
        uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-@@ -668,6 +738,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+@@ -668,6 +761,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
    if (packet == 0) {
      return true;
    }
@@ -6920,7 +7093,7 @@ index a744375..0eb241c 100644
  
    if (packet == 0xCDCDCDCD) {
      REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
-@@ -763,11 +834,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -763,11 +857,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      case PM4_INTERRUPT:
        result = ExecutePacketType3_INTERRUPT(reader, packet, count);
        break;
@@ -6935,7 +7108,7 @@ index a744375..0eb241c 100644
        result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
        break;
      case PM4_WAIT_REG_MEM:
-@@ -797,19 +868,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -797,19 +891,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      case PM4_EVENT_WRITE_ZPD:
        result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
        break;
@@ -6960,7 +7133,7 @@ index a744375..0eb241c 100644
        result = ExecutePacketType3_LOAD_ALU_CONSTANT(reader, packet, count);
        break;
      case PM4_SET_SHADER_CONSTANTS:
-@@ -914,6 +985,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
+@@ -914,6 +1008,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
                                                      uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -6971,7 +7144,7 @@ index a744375..0eb241c 100644
    // generate interrupt from the command stream
    uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
    for (int n = 0; n < 6; n++) {
-@@ -956,9 +1031,49 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -956,9 +1054,49 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
    uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
    uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
@@ -7022,17 +7195,22 @@ index a744375..0eb241c 100644
  
    ++counter_;
    return true;
-@@ -989,10 +1104,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -989,10 +1127,25 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
  
    bool is_memory = (wait_info & 0x10) != 0;
  
-+  // Expose ringbuffer progress and signal telemetry if we have to wait.
++  // Expose ringbuffer progress, hang telemetry, and clamped wait intervals.
 +  struct ScopedGpuWaitTelemetry {
++    CommandProcessor& cp;
 +    bool active = false;
++    explicit ScopedGpuWaitTelemetry(CommandProcessor& processor, uint32_t addr) : cp(processor) {
++      cp.SetWaitRegMemTelemetry(true, addr);
++    }
 +    ~ScopedGpuWaitTelemetry() {
++      cp.SetWaitRegMemTelemetry(false, 0);
 +      if (active) rex::SetGpuFenceWait(false);
 +    }
-+  } gpu_wait_guard;
++  } gpu_wait_guard(*this, poll_reg_addr);
 +  uint32_t wait_iters = 0;
 +
    bool matched = false;
@@ -7043,7 +7221,7 @@ index a744375..0eb241c 100644
        value =
            *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
        value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
-@@ -1030,24 +1155,72 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1030,24 +1183,77 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
@@ -7059,6 +7237,10 @@ index a744375..0eb241c 100644
 +        gpu_wait_guard.active = true;
 +        rex::SetGpuFenceWait(true);
 +      }
++      if (wait_iters == 200000) {
++        REXGPU_ERROR("WAIT_REG_MEM stalled: info=0x{:08X} addr=0x{:08X} ref=0x{:08X} mask=0x{:08X} val=0x{:08X}",
++                     wait_info, poll_reg_addr, ref, mask, value);
++      }
 +      // Wait (exclude guest wait/sleep time from PM4 GPU work timing).
 +      AccumulateExecBatchTime(false);
 +      if (rex::IsAppBackgroundPaused()) {
@@ -7070,26 +7252,27 @@ index a744375..0eb241c 100644
          PrepareForWait();
 -        if (!REXCVAR_GET(vsync)) {
 -          // User wants it fast and dangerous.
-+        const uint32_t wait_ms = wait / 0x100;
++        // Clamp PM4 wait intervals to <= 16 ms so large wait values never stall WorkerThreadMain.
++        const uint32_t wait_ms = std::min<uint32_t>(wait / 0x100, 16u);
 +#if defined(__APPLE__)
 +        if (wait_ms > 2) {
 +          rex::thread::Sleep(std::chrono::milliseconds(wait_ms));
 +        } else if (wait_iters <= 4) {
-+          rex::thread::MaybeYield();
-+        } else {
+           rex::thread::MaybeYield();
+         } else {
+-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
 +          rex::thread::Sleep(std::chrono::microseconds(250));
-+        }
+         }
 +#else
 +        if (!REXCVAR_GET(vsync) || wait_ms <= 2) {
 +          // User wants it fast, or short sub-2ms waits should avoid OS sleep quantization.
 +#if defined(_M_AMD64) || defined(__x86_64__)
 +          _mm_pause();
 +#endif
-           rex::thread::MaybeYield();
-         } else {
--          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          rex::thread::MaybeYield();
++        } else {
 +          rex::thread::Sleep(std::chrono::milliseconds(wait_ms));
-         }
++        }
 +#endif
          rex::thread::SyncMemory();
          ReturnFromWait();
@@ -7120,7 +7303,7 @@ index a744375..0eb241c 100644
        }
      }
    } while (!matched);
-@@ -1094,6 +1267,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1094,6 +1300,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
    auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
    mem_addr &= ~0x3;
    reg_val = GpuSwap(reg_val, endianness);
@@ -7129,7 +7312,7 @@ index a744375..0eb241c 100644
    memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
  
    return true;
-@@ -1101,6 +1276,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1101,6 +1309,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
  
  bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
@@ -7138,7 +7321,7 @@ index a744375..0eb241c 100644
    uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
    for (uint32_t i = 0; i < count - 1; i++) {
      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
-@@ -1214,6 +1391,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1214,6 +1424,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
    data_value = GpuSwap(data_value, endianness);
@@ -7147,7 +7330,7 @@ index a744375..0eb241c 100644
    memory::store(memory_->TranslatePhysical(address), data_value);
    return true;
  }
-@@ -1241,6 +1420,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
+@@ -1241,6 +1453,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
        1,                                         // max z
    };
    assert_true(endianness == xenos::Endian::k8in16);
@@ -7156,7 +7339,7 @@ index a744375..0eb241c 100644
    memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                       rex::countof(extents));
    return true;
-@@ -1292,6 +1473,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+@@ -1292,6 +1506,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
    // uint32_t viz_use = viz_query_condition & 0x100;
  
    assert_not_zero(count_remaining);
@@ -7164,7 +7347,7 @@ index a744375..0eb241c 100644
    if (!count_remaining) {
      REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
      return false;
-@@ -1368,6 +1550,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+@@ -1368,6 +1583,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
    // we don't support yet.
    reader->AdvanceRead(count_remaining * sizeof(uint32_t));
  
@@ -7179,7 +7362,7 @@ index a744375..0eb241c 100644
      auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
      if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..f34c922 100644
+index 19874a5..3e2d15d 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -31,6 +31,7 @@
@@ -7233,7 +7416,7 @@ index 19874a5..f34c922 100644
    cache_clear_requested_ = true;
  }
  
-@@ -112,11 +142,39 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
+@@ -112,11 +142,41 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
    if (shared_memory_) {
      shared_memory_->InvalidateAllPages();
    }
@@ -7247,6 +7430,8 @@ index 19874a5..f34c922 100644
 +    reinitialize_backend_requested_.store(true, std::memory_order_release);
 +    return true;
 +  }
++  SetWorkerStage("reinit_backend");
++  SetFrameOpenTelemetry(false);
 +  reinitialize_backend_requested_.store(false, std::memory_order_release);
 +  if (submission_open_) {
 +    EndSubmission(false);
@@ -7273,7 +7458,7 @@ index 19874a5..f34c922 100644
    for (VertexBufferState& state : vertex_buffer_states_) {
      state.address = UINT32_MAX;
      state.size = UINT32_MAX;
-@@ -152,7 +210,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+@@ -152,7 +212,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
  
  bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                 uint32_t packet, uint32_t count) {
@@ -7283,7 +7468,7 @@ index 19874a5..f34c922 100644
      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
    }
  
-@@ -297,6 +356,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
+@@ -297,6 +358,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
    assert_true(index_offset <= 32);
  
    // Try an existing root signature.
@@ -7291,7 +7476,7 @@ index 19874a5..f34c922 100644
    auto it = root_signatures_bindful_.find(index);
    if (it != root_signatures_bindful_.end()) {
      return it->second;
-@@ -725,6 +785,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
+@@ -725,6 +787,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
    if (size <= scratch_buffer_size_) {
      PushTransitionBarrier(scratch_buffer_, scratch_buffer_state_, state);
      scratch_buffer_state_ = state;
@@ -7299,7 +7484,7 @@ index 19874a5..f34c922 100644
      scratch_buffer_used_ = true;
      return scratch_buffer_;
    }
-@@ -749,6 +810,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
+@@ -749,6 +812,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
    scratch_buffer_ = buffer;
    scratch_buffer_size_ = size;
    scratch_buffer_state_ = state;
@@ -7307,7 +7492,7 @@ index 19874a5..f34c922 100644
    scratch_buffer_used_ = true;
    return scratch_buffer_;
  }
-@@ -764,6 +826,7 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
+@@ -764,6 +828,7 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
  }
  
  void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
@@ -7315,7 +7500,7 @@ index 19874a5..f34c922 100644
    if (current_external_pipeline_ != pipeline) {
      current_external_pipeline_ = pipeline;
      current_guest_pipeline_ = nullptr;
-@@ -772,6 +835,7 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
+@@ -772,6 +837,7 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
  }
  
  void D3D12CommandProcessor::SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature) {
@@ -7323,7 +7508,7 @@ index 19874a5..f34c922 100644
    if (current_graphics_root_signature_ != root_signature) {
      current_graphics_root_signature_ = root_signature;
      deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
-@@ -940,6 +1004,8 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -940,6 +1006,8 @@ bool D3D12CommandProcessor::SetupContext() {
      REXGPU_ERROR("Failed to initialize the render target cache");
      return false;
    }
@@ -7332,7 +7517,7 @@ index 19874a5..f34c922 100644
  
    // Initialize resource binding.
    constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
-@@ -1619,6 +1685,7 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -1619,6 +1687,7 @@ bool D3D12CommandProcessor::SetupContext() {
    }
  
    occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
@@ -7340,7 +7525,7 @@ index 19874a5..f34c922 100644
  
    // Just not to expose uninitialized memory.
    std::memset(&system_constants_, 0, sizeof(system_constants_));
-@@ -1627,9 +1694,11 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -1627,9 +1696,11 @@ bool D3D12CommandProcessor::SetupContext() {
  }
  
  void D3D12CommandProcessor::ShutdownContext() {
@@ -7352,7 +7537,15 @@ index 19874a5..f34c922 100644
  
    ui::d3d12::util::ReleaseAndNull(readback_buffer_);
    readback_buffer_size_ = 0;
-@@ -1768,8 +1837,34 @@ void D3D12CommandProcessor::ShutdownContext() {
+@@ -1743,6 +1814,7 @@ void D3D12CommandProcessor::ShutdownContext() {
+   ClearCommandAllocatorCache();
+ 
+   frame_open_ = false;
++  SetFrameOpenTelemetry(false);
+   frame_current_ = 1;
+   frame_completed_ = 0;
+   std::memset(closed_frame_submissions_, 0, sizeof(closed_frame_submissions_));
+@@ -1768,8 +1840,34 @@ void D3D12CommandProcessor::ShutdownContext() {
    CommandProcessor::ShutdownContext();
  }
  
@@ -7387,7 +7580,7 @@ index 19874a5..f34c922 100644
  
    if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
      if (frame_open_) {
-@@ -1877,9 +1972,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+@@ -1877,9 +1975,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
        texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
      }
      InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
@@ -7404,10 +7597,11 @@ index 19874a5..f34c922 100644
    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
  }
  
-@@ -1894,8 +1996,26 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -1894,8 +1999,27 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
  void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
++  SetWorkerStage("issue_swap");
 +  consecutive_draw_state_valid_ = false;
 +  recent_frontbuffer_addresses_[recent_frontbuffer_cursor_ & 3] = frontbuffer_ptr;
 +  ++recent_frontbuffer_cursor_;
@@ -7431,7 +7625,7 @@ index 19874a5..f34c922 100644
  
    if (!graphics_system_)
      return;
-@@ -2254,6 +2374,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2254,6 +2378,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
    // End the frame even if did not present for any reason (the image refresher
    // was not called), to prevent leaking per-frame resources.
    EndSubmission(true);
@@ -7441,7 +7635,7 @@ index 19874a5..f34c922 100644
  }
  
  void D3D12CommandProcessor::OnPrimaryBufferEnd() {
-@@ -2271,6 +2394,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+@@ -2271,6 +2398,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
  bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -7451,7 +7645,7 @@ index 19874a5..f34c922 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -2341,6 +2467,84 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2341,6 +2471,84 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
      return true;
    }
  
@@ -7536,7 +7730,7 @@ index 19874a5..f34c922 100644
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
    // Shader modifications.
-@@ -2462,6 +2666,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2462,6 +2670,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    // Update viewport, scissor, blend factor and stencil reference.
    UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
  
@@ -7554,7 +7748,7 @@ index 19874a5..f34c922 100644
    // Update system constants before uploading them.
    // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
    UpdateSystemConstantValues(memexport_used, primitive_polygonal,
-@@ -2476,6 +2691,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2476,6 +2695,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    // Must not call anything that can change the descriptor heap from now on!
  
    // Ensure vertex buffers are resident.
@@ -7563,7 +7757,7 @@ index 19874a5..f34c922 100644
    const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
      uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
-@@ -2484,43 +2701,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2484,43 +2705,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        vfetch_bits_remaining &= ~(uint32_t(1) << j);
        uint32_t vfetch_index = i * 32 + j;
        uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
@@ -7630,7 +7824,7 @@ index 19874a5..f34c922 100644
      }
    }
  
-@@ -2553,6 +2762,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2553,6 +2766,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
      }
    }
  
@@ -7656,7 +7850,23 @@ index 19874a5..f34c922 100644
    // Primitive topology.
    D3D_PRIMITIVE_TOPOLOGY primitive_topology;
    if (primitive_processing_result.IsTessellated()) {
-@@ -2855,6 +3083,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+@@ -2734,6 +2966,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
+   if (!total_size || memexport_ranges_.empty()) {
+     return true;
+   }
++  ScopedReadbackTelemetry readback_guard(*this);
+ 
+   ID3D12Resource* readback_buffer = RequestReadbackBuffer(total_size);
+   if (!readback_buffer) {
+@@ -2779,6 +3012,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+   if (!total_size || memexport_ranges_.empty()) {
+     return true;
+   }
++  ScopedReadbackTelemetry readback_guard(*this);
+ 
+   const uint64_t readback_key =
+       MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+@@ -2855,6 +3089,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
                               readback.submission_written[read_index] &&
                               readback.submission_written[read_index] <= submission_completed_;
    if (!previous_slot_ready) {
@@ -7667,7 +7877,7 @@ index 19874a5..f34c922 100644
      IssueDraw_MemexportReadbackFullPath(total_size);
      readback.current_index = read_index;
      return true;
-@@ -2871,6 +3103,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+@@ -2871,6 +3109,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
  }
  
  bool D3D12CommandProcessor::IssueCopy() {
@@ -7678,7 +7888,7 @@ index 19874a5..f34c922 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -2878,12 +3114,18 @@ bool D3D12CommandProcessor::IssueCopy() {
+@@ -2878,15 +3120,22 @@ bool D3D12CommandProcessor::IssueCopy() {
      return false;
    }
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
@@ -7700,7 +7910,11 @@ index 19874a5..f34c922 100644
  }
  
  bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -2926,7 +3168,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
++  ScopedReadbackTelemetry readback_guard(*this);
+   uint32_t written_address, written_length;
+   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
+                                      written_length)) {
+@@ -2926,7 +3175,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
          rb.buffers[write_index]->Unmap(0, nullptr);
          rb.mapped_data[write_index] = nullptr;
        }
@@ -7714,7 +7928,7 @@ index 19874a5..f34c922 100644
      }
      rb.buffers[write_index] = buffer;
      rb.sizes[write_index] = size;
-@@ -3069,9 +3316,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3069,9 +3323,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                 written_address, written_length);
    }
  
@@ -7729,7 +7943,7 @@ index 19874a5..f34c922 100644
    uint32_t read_index = write_index;
    if (use_delayed_sync) {
      read_index = 1 - write_index;
-@@ -3083,13 +3334,24 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3083,13 +3341,24 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
    if (use_delayed_sync && (!rb.buffers[read_index] || written_length > rb.sizes[read_index] ||
                             !rb.mapped_data[read_index])) {
      is_cache_miss = true;
@@ -7757,7 +7971,91 @@ index 19874a5..f34c922 100644
    if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
        rb.mapped_data[read_index]) {
      uint8_t* destination = memory_->TranslatePhysical(written_address);
-@@ -3185,6 +3447,16 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3102,6 +3371,51 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   return true;
+ }
+ 
++namespace {
++
++void AwaitFenceEventBounded(ID3D12Device* device, ID3D12Fence* fence, UINT64 await_value,
++                            HANDLE fence_event, const std::atomic<bool>& running,
++                            GraphicsSystem* graphics_system, const char* op_name) {
++  if (!fence || !fence_event) {
++    return;
++  }
++  uint32_t wait_seconds = 0;
++  while (fence->GetCompletedValue() < await_value) {
++    const DWORD wait_rc = WaitForSingleObject(fence_event, 1000);
++    if (fence->GetCompletedValue() >= await_value) {
++      return;
++    }
++    if (!running.load(std::memory_order_acquire)) {
++      return;
++    }
++    if (device) {
++      const HRESULT removed = device->GetDeviceRemovedReason();
++      if (FAILED(removed)) {
++        REXGPU_ERROR("D3D12CommandProcessor: device removed (0x{:08X}) while awaiting {}",
++                     static_cast<uint32_t>(removed), op_name);
++        if (graphics_system) {
++          graphics_system->OnHostGpuLossFromAnyThread(removed != DXGI_ERROR_DEVICE_REMOVED);
++        }
++        return;
++      }
++    }
++    if (wait_rc == WAIT_FAILED) {
++      REXGPU_ERROR("D3D12CommandProcessor: WaitForSingleObject failed while awaiting {}", op_name);
++      return;
++    }
++    if (++wait_seconds == 2 || wait_seconds >= 10) {
++      REXGPU_ERROR(
++          "D3D12CommandProcessor: {} fence wait stalled ({}s, completed={} await={})", op_name,
++          wait_seconds, fence->GetCompletedValue(), await_value);
++      if (wait_seconds >= 10) {
++        return;
++      }
++    }
++  }
++}
++
++}  // namespace
++
+ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   if (await_submission >= submission_current_) {
+     if (submission_open_) {
+@@ -3114,11 +3428,15 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (queue_operations_done_since_submission_signal_) {
+       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
+       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
+-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
+-                        fence_value, fence_completion_event_)))) {
++      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value)) &&
++          SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
++              fence_value, fence_completion_event_))) {
+         PROFILE_CMD_BUFFER_STALL();
+-        WaitForSingleObject(fence_completion_event_, INFINITE);
++        SetWorkerStage("fence_wait_queue_ops");
++        AwaitFenceEventBounded(GetD3D12Provider().GetDevice(),
++                               queue_operations_since_submission_fence_, fence_value,
++                               fence_completion_event_, worker_running_, graphics_system_,
++                               "queue_operations");
+         queue_operations_done_since_submission_signal_ = false;
+       } else {
+         REXGPU_ERROR(
+@@ -3137,7 +3455,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (SUCCEEDED(
+             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
+       PROFILE_CMD_BUFFER_STALL();
+-      WaitForSingleObject(fence_completion_event_, INFINITE);
++      SetWorkerStage("fence_wait_submission");
++      AwaitFenceEventBounded(GetD3D12Provider().GetDevice(), submission_fence_, await_submission,
++                             fence_completion_event_, worker_running_, graphics_system_,
++                             "submission");
+       submission_completed_ = submission_fence_->GetCompletedValue();
+     }
+   }
+@@ -3185,6 +3506,16 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
      resources_for_deletion_.pop_front();
    }
  
@@ -7774,7 +8072,7 @@ index 19874a5..f34c922 100644
    shared_memory_->CompletedSubmissionUpdated();
  
    render_target_cache_->CompletedSubmissionUpdated();
-@@ -3192,6 +3464,24 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3192,6 +3523,24 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
    primitive_processor_->CompletedSubmissionUpdated();
  
    texture_cache_->CompletedSubmissionUpdated(submission_completed_);
@@ -7799,7 +8097,7 @@ index 19874a5..f34c922 100644
  }
  
  void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
-@@ -3297,6 +3587,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3297,6 +3646,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
  
    if (!submission_open_) {
      submission_open_ = true;
@@ -7807,10 +8105,11 @@ index 19874a5..f34c922 100644
  
      // Start a new deferred command list - will submit it to the real one in the
      // end of the submission (when async pipeline creation requests are
-@@ -3331,6 +3622,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3331,6 +3681,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
  
    if (is_opening_frame) {
      frame_open_ = true;
++    SetFrameOpenTelemetry(true);
 +    if (timestamp_query_heap_ && !frame_timestamp_started_) {
 +      active_timestamp_slot_ = uint32_t(frame_current_ % kMaxTimestampFrames);
 +      pending_timestamps_[active_timestamp_slot_].valid = false;
@@ -7821,7 +8120,7 @@ index 19874a5..f34c922 100644
  
      // Reset bindings that depend on the data stored in the pools.
      std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
-@@ -3402,6 +3700,19 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3402,6 +3760,19 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    if (submission_open_) {
      assert_false(scratch_buffer_used_);
  
@@ -7841,7 +8140,7 @@ index 19874a5..f34c922 100644
      if (active_occlusion_query_.valid && occlusion_query_heap_) {
        deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                           active_occlusion_query_.host_index);
-@@ -3443,8 +3754,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3443,8 +3814,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
      }
  
      direct_queue->Signal(submission_fence_, submission_current_++);
@@ -7854,7 +8153,11 @@ index 19874a5..f34c922 100644
  
      // Queue operations done directly (like UpdateTileMappings) will be awaited
      // alongside the last submission if needed.
-@@ -3459,6 +3774,33 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3456,9 +3831,37 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+     }
+     frame_open_ = false;
++    SetFrameOpenTelemetry(false);
      // Submission already closed now, so minus 1.
      closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
  
@@ -7888,7 +8191,7 @@ index 19874a5..f34c922 100644
      if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
        cache_clear_requested_ = false;
  
-@@ -4003,93 +4345,27 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+@@ -4003,93 +4406,27 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
    cbuffer_binding_system_.up_to_date &= !dirty;
  }
  
@@ -7943,6 +8246,10 @@ index 19874a5..f34c922 100644
 -  uint32_t root_parameter_shared_memory_and_bindful_edram =
 -      bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
 -                               : kRootParameter_Bindful_SharedMemoryAndEdram;
+-
+-  //
+-  // Update root constant buffers that are common for bindful and bindless.
+-  //
 +  const uint32_t root_parameter_float_constants_pixel =
 +      bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsPixel
 +                               : kRootParameter_Bindful_FloatConstantsPixel;
@@ -7953,10 +8260,6 @@ index 19874a5..f34c922 100644
 +      bindless_resources_used_ ? kRootParameter_Bindless_BoolLoopConstants
 +                               : kRootParameter_Bindful_BoolLoopConstants;
  
--  //
--  // Update root constant buffers that are common for bindful and bindless.
--  //
--
 -  // These are the constant base addresses/ranges for shaders.
 -  // We have these hardcoded right now cause nothing seems to differ on the Xbox
 -  // 360 (however, OpenGL ES on Adreno 200 on Android has different ranges).
@@ -7999,7 +8302,7 @@ index 19874a5..f34c922 100644
    if (!cbuffer_binding_system_.up_to_date) {
      uint8_t* system_constants = constant_buffer_pool_->Request(
          frame_current_, sizeof(system_constants_), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-@@ -4102,10 +4378,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4102,10 +4439,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
      current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
    }
    if (!cbuffer_binding_float_vertex_.up_to_date) {
@@ -8012,7 +8315,7 @@ index 19874a5..f34c922 100644
      uint8_t* float_constants = constant_buffer_pool_->Request(
          frame_current_, sizeof(float) * 4 * std::max(float_constant_count_vertex, uint32_t(1)),
          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-@@ -4180,6 +4454,144 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4180,6 +4515,144 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
      cbuffer_binding_fetch_.up_to_date = true;
      current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
    }
@@ -8157,7 +8460,7 @@ index 19874a5..f34c922 100644
  
    //
    // Update descriptors.
-@@ -4639,31 +5051,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4639,31 +5112,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
    }
  
    // Update the root parameters.
@@ -8190,7 +8493,7 @@ index 19874a5..f34c922 100644
    if (!(current_graphics_root_up_to_date_ &
          (1u << root_parameter_shared_memory_and_bindful_edram))) {
      assert_true(current_shared_memory_binding_is_uav_.has_value());
-@@ -4866,6 +5254,62 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
+@@ -4866,6 +5315,62 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
    occlusion_query_heap_.Reset();
  }
  
@@ -9277,7 +9580,7 @@ index e2983a4..b412b93 100644
  REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..1b66947 100644
+index 8f2fcb0..8618b72 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -13,6 +13,7 @@
@@ -9461,7 +9764,7 @@ index 8f2fcb0..1b66947 100644
  void GraphicsSystem::ClearCaches() {
    command_processor_->CallInThread([&]() { command_processor_->ClearCaches(); });
  }
-@@ -339,6 +438,14 @@ void GraphicsSystem::InvalidateGpuMemory() {
+@@ -339,6 +438,23 @@ void GraphicsSystem::InvalidateGpuMemory() {
    command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
  }
  
@@ -9470,6 +9773,15 @@ index 8f2fcb0..1b66947 100644
 +    return false;
 +  }
 +  command_processor_->CallInThread([this]() { command_processor_->ReinitializeBackendContext(); });
++  return true;
++}
++
++bool GraphicsSystem::GetCommandProcessorHangState(
++    system::CommandProcessorHangState& out_state) const {
++  if (!command_processor_) {
++    return false;
++  }
++  command_processor_->GetHangState(out_state);
 +  return true;
 +}
 +
@@ -11066,7 +11378,7 @@ index 8b862fc..9057687 100644
  
  REX_EXPORT_STUB(__imp__RtlAnsiStringToUnicodeString);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-index 57fd161..ef9de6f 100644
+index 57fd161..0d748b5 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 @@ -38,11 +38,45 @@
@@ -11124,7 +11436,7 @@ index 57fd161..ef9de6f 100644
      return result;
    }
  
-@@ -380,7 +416,19 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
+@@ -380,7 +416,21 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
      thread->DeliverAPCs();
    }
  
@@ -11142,10 +11454,12 @@ index 57fd161..ef9de6f 100644
 +    ScopedKernelWaitTimer wait_timer(3);
 +    result = thread->Delay(processor_mode, alertable, interval);
 +  }
++  rex::RecordLastImport("KeDelayExecutionThread", static_cast<uint32_t>(interval),
++                        static_cast<uint32_t>(interval >> 32), result);
  
    if (alertable && result == X_STATUS_USER_APC) {
      thread->DeliverAPCs();
-@@ -844,8 +892,12 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+@@ -844,8 +894,13 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
    // object_ptr.guest_address(), (uint32_t)wait_reason,
    //(uint32_t)processor_mode, (uint32_t)alertable,
    // timeout_ptr ? (int64_t)timeout : -1);
@@ -11157,10 +11471,11 @@ index 57fd161..ef9de6f 100644
 +    result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
 +                                     timeout_ptr ? &timeout : nullptr);
 +  }
++  rex::RecordLastImport("KeWaitForSingleObject", object_ptr.guest_address(), wait_reason, result);
    // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
    return result;
  }
-@@ -857,7 +909,10 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+@@ -857,13 +912,17 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
    auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
    if (object) {
      uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
@@ -11172,7 +11487,14 @@ index 57fd161..ef9de6f 100644
      if (alertable && result == X_STATUS_USER_APC) {
        XThread::GetCurrentThread()->DeliverAPCs();
      }
-@@ -885,9 +940,13 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
++  rex::RecordLastImport("NtWaitForSingleObjectEx", object_handle, alertable, result);
+ 
+   return result;
+ }
+@@ -885,9 +944,14 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
    }
  
    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
@@ -11186,10 +11508,11 @@ index 57fd161..ef9de6f 100644
 +        uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type,
 +        wait_reason, processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
 +  }
++  rex::RecordLastImport("KeWaitForMultipleObjects", count, wait_type, result);
    if (alertable && result == X_STATUS_USER_APC) {
      XThread::GetCurrentThread()->DeliverAPCs();
    }
-@@ -920,6 +979,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+@@ -920,6 +984,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
  u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                       u32 alertable, mapped_u64 timeout_ptr) {
    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
@@ -11197,7 +11520,7 @@ index 57fd161..ef9de6f 100644
    return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                        timeout_ptr ? &timeout : nullptr);
  }
-@@ -932,6 +992,7 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
+@@ -932,11 +997,13 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
    auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
    if (signal_object && wait_object) {
      uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
@@ -11205,8 +11528,14 @@ index 57fd161..ef9de6f 100644
      result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
                                      timeout_ptr ? &timeout : nullptr);
    } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
++  rex::RecordLastImport("NtSignalAndWaitForSingleObjectEx", signal_handle, wait_handle, result);
+ 
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 1254710..a9b4ec1 100644
+index 1254710..4325a51 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -14,9 +14,21 @@
@@ -11251,7 +11580,7 @@ index 1254710..a9b4ec1 100644
    }
  }
  }  // namespace
-@@ -437,6 +452,83 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
+@@ -437,6 +452,92 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
    return 0;
  }
  
@@ -11327,19 +11656,32 @@ index 1254710..a9b4ec1 100644
 +
 +void VdBlockUntilVerticalBlank_entry() {
 +  // Never pace or skip VdSwap's 60.0 Hz ceiling here; VdSwap_entry owns guest swap pacing.
++  rex::RecordLastImport("VdBlockUntilVerticalBlank", 0, 0, 0);
++  const bool track_main = XThread::IsInThread() && XThread::GetCurrentThread() &&
++                          XThread::GetCurrentThread()->main_thread();
++  if (track_main) {
++    rex::SetGuestThreadState(4);
++  }
 +  if (auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system()) {
 +    graphics_system->NotifyGuestFrameSwap(true);
++  }
++  if (track_main) {
++    rex::SetGuestThreadState(1);
 +  }
 +}
 +
  void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                    mapped_void unk2,            // system writeback ptr
-@@ -445,6 +537,134 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -445,6 +546,138 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                    mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                    mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                    mapped_u32 height) {
 +  auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
++  rex::RecordLastImport("VdSwap",
++                        frontbuffer_ptr ? static_cast<uint32_t>(*frontbuffer_ptr) : 0u,
++                        width ? static_cast<uint32_t>(*width) : 0u,
++                        height ? static_cast<uint32_t>(*height) : 0u);
 +
 +  static bool prev_frame_skipped = false;
 +  static uint32_t consecutive_skips = 0;
@@ -11470,7 +11812,7 @@ index 1254710..a9b4ec1 100644
    // All of these parameters are REQUIRED.
    assert(buffer_ptr);
    assert(fetch_ptr);
-@@ -459,20 +679,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -459,20 +692,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    memory::copy_and_swap_32_unaligned(&gpu_fetch,
                                       reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
  
@@ -11491,7 +11833,7 @@ index 1254710..a9b4ec1 100644
      REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
                    frontbuffer_virtual_address);
      return;
-@@ -487,11 +699,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -487,11 +712,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    assert_true(*width == 1 + gpu_fetch.size_2d.width);
    assert_true(*height == 1 + gpu_fetch.size_2d.height);
  
@@ -11503,7 +11845,7 @@ index 1254710..a9b4ec1 100644
    buffer_ptr.Zero(64 * 4);
  
    uint32_t offset = 0;
-@@ -507,12 +714,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -507,12 +727,13 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    dwords[offset++] = gpu_fetch.dword_4;
    dwords[offset++] = gpu_fetch.dword_5;
  
@@ -11518,7 +11860,7 @@ index 1254710..a9b4ec1 100644
  
    // Fill the rest of the buffer with NOP packets.
    for (uint32_t i = offset; i < 64; i++) {
-@@ -582,3 +790,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
+@@ -582,3 +803,5 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
  REX_EXPORT(__imp__VdRetrainEDRAMWorker, rex::kernel::xboxkrnl::VdRetrainEDRAMWorker_entry)
  REX_EXPORT(__imp__VdRetrainEDRAM, rex::kernel::xboxkrnl::VdRetrainEDRAM_entry)
  REX_EXPORT(__imp__VdSwap, rex::kernel::xboxkrnl::VdSwap_entry)
