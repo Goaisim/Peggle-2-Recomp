@@ -522,15 +522,29 @@ static std::atomic<uint32_t> g_f2c8_updates{0};
 static std::atomic<uint32_t> g_rate_hook_hz{0};
 static std::atomic<uint32_t> g_rate_vdswap_hz{0};
 static std::atomic<uint32_t> g_rate_gpuswap_hz{0};
+static std::atomic<uint32_t> g_rate_gpu_draws_hz{0};
+static std::atomic<uint32_t> g_rate_gpu_resolves_hz{0};
+static std::atomic<uint64_t> g_gpu_early_returns{0};
+static std::atomic<uint64_t> g_gpu_fence_timeouts{0};
+static std::atomic<int> g_gpu_device_lost{0};
 static std::atomic<uint32_t> g_rate_vblank_hz{0};
 static std::atomic<uint32_t> g_rate_present_hz{0};
 static std::atomic<uint32_t> g_guest_gpu_timeout_count{0};
+static std::atomic<bool> g_input_debug_game_active{false};
+static std::atomic<bool> g_input_debug_ctrl_active{false};
+static std::atomic<bool> g_input_debug_cursor_valid{false};
+static std::atomic<float> g_input_debug_cursor_nx{0.0f};
+static std::atomic<float> g_input_debug_cursor_ny{0.0f};
+static std::atomic<bool> g_input_debug_primary_down{false};
+static std::atomic<uint16_t> g_input_debug_buttons{0};
+static std::atomic<bool> g_manual_diag_requested{false};
+static std::atomic<int64_t> g_manual_dump_flash_until_ms{0};
 static std::atomic<uint32_t> g_main_xthread_tid{0};
 static std::atomic<const char*> g_main_xthread_stage{"guest"};
 static std::atomic<bool> g_guest_hang_detected{false};
 static std::atomic<bool> g_hang_is_gpu_stall{false};
 static std::mutex g_hang_hud_mutex;
-static char g_hang_hud_state[96]{};
+static char g_hang_hud_state[160]{};
 
 struct ScopedMainThreadStage {
   const char* prev;
@@ -1846,6 +1860,29 @@ static void RunColliderSelfCheck() {
       TC_ASSERT(StepFixedSimAccumulator(100'000'000LL, acc));
       TC_ASSERT(acc == 50'000'000LL - 2 * kGuestHookIntervalNs);
     }
+    // 9. Mountain Highs ice-blue card glass & animated-motion click unblocking regression check
+    {
+      clear_frame(70, 120, 60);
+      add_bottom_bar();
+      fill_rect(0.165f, 0.450f, 0.225f, 0.680f, 125, 175, 225);  // Berg ice-blue glass (IsUiBlue, NOT IsButtonBlue)
+      fill_rect(0.228f, 0.495f, 0.342f, 0.640f, 245, 200, 30);   // Bright yellow LEVELS button (Mountain Highs)
+      fill_rect(0.348f, 0.495f, 0.462f, 0.640f, 45, 50, 58);     // Locked TRIALS button
+      fill_rect(0.580f, 0.340f, 0.960f, 0.740f, 40, 125, 200);   // Next world right card (not Celestial)
+      rex_monitor::InjectSyntheticFrameForTest(frame.data(), W, H, 50);
+      rex_monitor::SetScreenForTest(SCREEN_ADVENTURE_CAROUSEL);
+      rex_monitor::GetScreenWatcherState(st, cands);
+      TC_ASSERT(st.screen_id == SCREEN_ADVENTURE_CAROUSEL && cands.size() == 6 &&
+                std::strcmp(cands[1].name, "ADV_LEVELS") == 0);
+      auto mh_click = rex_monitor::StepMenuFocusServo(0.310f, 0.570f, true, true, false, 20000);
+      TC_ASSERT(mh_click.has_target && std::strcmp(mh_click.target_name, "ADV_LEVELS") == 0 &&
+                mh_click.buttons_or_mask == 0x1000);
+      // Heavy >12% particle motion during transition: must still settle & unblock before 1.5s-3.5s
+      fill_rect(0.05f, 0.05f, 0.45f, 0.45f, 240, 240, 240);
+      rex_monitor::InjectSyntheticFrameForTest(frame.data(), W, H, 51);
+      auto mh_after = rex_monitor::StepMenuFocusServo(0.500f, 0.600f, true, true, false, 20850);
+      TC_ASSERT(mh_after.buttons_or_mask == 0x1000);
+      if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 9 (Mountain Highs + settle unblock) passed\n");
+    }
     if (tc_log) AppendTcFileLog("C:/Peggle2Recomp/tc_audit.log", "[TC] Section 8 (pause hover + visual turret + deadzone) passed\n");
     rex_monitor::ClearTestState();
   }
@@ -1948,6 +1985,11 @@ struct ReplaySnapEvent {
   std::string path;
 };
 
+struct ReplayEdramEvent {
+  uint64_t tick = 0;
+  int mode = 0;
+};
+
 static std::vector<InputSample> g_play_events;
 static size_t g_play_cursor = 0;
 static InputSample g_play_current{};
@@ -1961,6 +2003,8 @@ static bool g_play_menu_hover = false;
 static bool g_play_menu_click_queued = false;
 static std::vector<ReplaySnapEvent> g_play_snap_events;
 static size_t g_play_snap_cursor = 0;
+static std::vector<ReplayEdramEvent> g_play_edram_events;
+static size_t g_play_edram_cursor = 0;
 static uint64_t g_play_exit_tick = 0;
 static uint16_t g_play_prev_action_mask = 0;
 static uint16_t g_play_dpad_mask = 0;
@@ -2112,6 +2156,7 @@ static bool StartInputReplay(const std::filesystem::path& path) {
   std::vector<InputSample> parsed;
   std::vector<ReplayMenuEvent> parsed_menu;
   std::vector<ReplaySnapEvent> parsed_snap;
+  std::vector<ReplayEdramEvent> parsed_edram;
   uint64_t parsed_exit_tick = 0;
   bool has_end_tick = false;
   uint64_t parsed_end_tick = 0;
@@ -2145,6 +2190,17 @@ static bool StartInputReplay(const std::filesystem::path& path) {
           if (iss >> se.tick >> se.path) {
             parsed_snap.push_back(std::move(se));
             parsed_end_tick = (std::max)(parsed_end_tick, parsed_snap.back().tick + 1);
+            has_end_tick = true;
+          }
+        } else if (tag == "edram") {
+          ReplayEdramEvent ee{};
+          std::string mode_tok;
+          if (iss >> ee.tick >> mode_tok) {
+            if (mode_tok == "rtv" || mode_tok == "RTV") ee.mode = kEdramRtv;
+            else if (mode_tok == "rov" || mode_tok == "ROV") ee.mode = kEdramRov;
+            else ee.mode = kEdramAuto;
+            parsed_edram.push_back(ee);
+            parsed_end_tick = (std::max)(parsed_end_tick, ee.tick + 1);
             has_end_tick = true;
           }
         } else if (tag == "exit") {
@@ -2186,7 +2242,7 @@ static bool StartInputReplay(const std::filesystem::path& path) {
     }
   }
 
-  if (parsed.empty() && parsed_menu.empty() && parsed_snap.empty() &&
+  if (parsed.empty() && parsed_menu.empty() && parsed_snap.empty() && parsed_edram.empty() &&
       (!has_end_tick || parsed_end_tick == 0)) {
     printf("[INPUT] WARNING: Replay file has no events: %s\n", path.string().c_str());
     fflush(stdout);
@@ -2199,6 +2255,8 @@ static bool StartInputReplay(const std::filesystem::path& path) {
                    [](const ReplayMenuEvent& a, const ReplayMenuEvent& b) { return a.tick < b.tick; });
   std::stable_sort(parsed_snap.begin(), parsed_snap.end(),
                    [](const ReplaySnapEvent& a, const ReplaySnapEvent& b) { return a.tick < b.tick; });
+  std::stable_sort(parsed_edram.begin(), parsed_edram.end(),
+                   [](const ReplayEdramEvent& a, const ReplayEdramEvent& b) { return a.tick < b.tick; });
   uint64_t end_tick = parsed.empty() ? 0 : (parsed.back().tick + 1);
   if (has_end_tick) {
     end_tick = (std::max)(end_tick, parsed_end_tick);
@@ -2208,10 +2266,12 @@ static bool StartInputReplay(const std::filesystem::path& path) {
   g_play_events = std::move(parsed);
   g_play_menu_events = std::move(parsed_menu);
   g_play_snap_events = std::move(parsed_snap);
+  g_play_edram_events = std::move(parsed_edram);
   g_play_exit_tick = parsed_exit_tick;
   g_play_cursor = 0;
   g_play_menu_cursor = 0;
   g_play_snap_cursor = 0;
+  g_play_edram_cursor = 0;
   g_play_menu_active = false;
   g_play_menu_hover = false;
   g_play_menu_click_queued = false;
@@ -2241,6 +2301,7 @@ static bool TryStepInputReplay(InputSample& out, uint64_t now_ms) {
   float mx = 0.5f, my = 0.5f;
   bool mhover = false, mclick = false;
   std::vector<std::string> due_snaps;
+  int pending_edram_mode = -1;
   bool do_exit = false;
   uint64_t cur_tick = 0;
   bool replay_finished = false;
@@ -2276,6 +2337,10 @@ static bool TryStepInputReplay(InputSample& out, uint64_t now_ms) {
              g_play_snap_events[g_play_snap_cursor].tick <= tick) {
         due_snaps.push_back(g_play_snap_events[g_play_snap_cursor++].path);
       }
+      while (g_play_edram_cursor < g_play_edram_events.size() &&
+             g_play_edram_events[g_play_edram_cursor].tick <= tick) {
+        pending_edram_mode = g_play_edram_events[g_play_edram_cursor++].mode;
+      }
       if (g_play_exit_tick > 0 && tick >= g_play_exit_tick) {
         do_exit = true;
       }
@@ -2297,15 +2362,26 @@ static bool TryStepInputReplay(InputSample& out, uint64_t now_ms) {
     return true;  // Emit one neutral frame so no buttons remain latched on exit.
   }
 
+#if !REX_PLATFORM_IOS
+  if (pending_edram_mode >= 0) {
+    g_opt_edram_mode.store(pending_edram_mode, std::memory_order_relaxed);
+    ApplyEdramModeSetting(pending_edram_mode, true);
+    SaveUserSettings();
+    printf("[INPUT] Replay # edram mode=%d at tick %llu\n", pending_edram_mode,
+           static_cast<unsigned long long>(cur_tick));
+    fflush(stdout);
+  }
+#endif
+
   for (const auto& spath : due_snaps) {
     RexScreenWatcherStatus st{};
     size_t cnt = 0;
     const bool ok = rex_monitor::SaveScreenWatcherPng(spath.c_str(), &st, &cnt);
-    printf("[SNAP] tick=%llu ok=%d screen=%s cand=%zu hl=%s(%d,%d) tgt=%s motion=%.1f%% -> %s\n",
+    printf("[SNAP] tick=%llu ok=%d screen=%s cand=%zu hl=%s(%d,%d) tgt=%s motion=%.1f%% hash=0x%08X -> %s\n",
            static_cast<unsigned long long>(cur_tick), ok ? 1 : 0,
            st.screen_name[0] ? st.screen_name : "UNKNOWN", cnt,
            st.has_highlight ? st.hl_name : "none", int(st.hl_row), int(st.hl_col),
-           st.has_target ? st.target_name : "None", st.motion_pct, spath.c_str());
+           st.has_target ? st.target_name : "None", st.motion_pct, st.pixel_hash, spath.c_str());
     fflush(stdout);
   }
 
@@ -2443,6 +2519,7 @@ extern "C" REX_FUNC(sub_8261FE50) {
   static bool prev_f3 = false;
   static bool prev_f6 = false;
   static bool prev_f7 = false;
+  static bool prev_f9 = false;
   static bool prev_up = false;
   static bool prev_down = false;
   static bool prev_left = false;
@@ -2484,6 +2561,9 @@ extern "C" REX_FUNC(sub_8261FE50) {
     } else {
       StartInputReplay(ResolveDefaultReplayPath());
     }
+  }
+  if (poll_key_edge(VK_F9, prev_f9) && swap_game_active) {
+    g_manual_diag_requested.store(true, std::memory_order_release);
   }
 
   const bool esc_edge = poll_key_edge(VK_ESCAPE, prev_esc);
@@ -2749,26 +2829,28 @@ PEGGLE_WRAP_NET_FAIL(sub_822FC718, rc < 0)
 #ifdef _WIN32
 static HANDLE g_app_big_icon = nullptr;
 static HANDLE g_app_sm_icon = nullptr;
-static HWND g_app_hwnd = nullptr;
+static std::atomic<HWND> g_app_hwnd{nullptr};
 
 static HWND EnsureAppWindowIcon() {
-  if (!g_app_hwnd || !IsWindow(g_app_hwnd)) {
+  HWND hwnd = g_app_hwnd.load(std::memory_order_acquire);
+  if (!hwnd || !IsWindow(hwnd)) {
     struct FindCtx { DWORD pid; HWND found; } ctx{GetCurrentProcessId(), nullptr};
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+    EnumWindows([](HWND hw, LPARAM lp) -> BOOL {
       auto* c = reinterpret_cast<FindCtx*>(lp);
       DWORD pid = 0;
-      GetWindowThreadProcessId(hwnd, &pid);
-      if (pid == c->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+      GetWindowThreadProcessId(hw, &pid);
+      if (pid == c->pid && IsWindowVisible(hw) && GetWindow(hw, GW_OWNER) == nullptr) {
         RECT r{};
-        if (GetWindowRect(hwnd, &r) && (r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
-          c->found = hwnd;
+        if (GetWindowRect(hw, &r) && (r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
+          c->found = hw;
           return FALSE;
         }
       }
       return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
-    g_app_hwnd = ctx.found;
-    if (g_app_hwnd) {
+    hwnd = ctx.found;
+    g_app_hwnd.store(hwnd, std::memory_order_release);
+    if (hwnd) {
       HINSTANCE hinst = GetModuleHandleW(nullptr);
       if (!g_app_big_icon) {
         g_app_big_icon = LoadImageW(hinst, MAKEINTRESOURCEW(101), IMAGE_ICON,
@@ -2780,11 +2862,11 @@ static HWND EnsureAppWindowIcon() {
                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
                                    LR_DEFAULTCOLOR | LR_SHARED);
       }
-      if (g_app_big_icon) SendMessageW(g_app_hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_app_big_icon));
-      if (g_app_sm_icon)  SendMessageW(g_app_hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_app_sm_icon));
+      if (g_app_big_icon) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_app_big_icon));
+      if (g_app_sm_icon)  SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_app_sm_icon));
     }
   }
-  return g_app_hwnd;
+  return hwnd;
 }
 #else
 static void EnsureAppWindowIcon() {}
@@ -3173,7 +3255,8 @@ static void WriteResolvedWinStack(FILE* f, const char* label, const uint64_t* pc
 #endif
 
 static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uint64_t stall_ms,
-                              uint64_t total_hooks, bool is_gpu_stall) {
+                              uint64_t total_hooks, bool is_gpu_stall,
+                              bool is_manual_dump = false) {
   rex::system::CommandProcessorHangState cp{};
   bool has_cp = false;
   if (auto* rt = rex::Runtime::instance()) {
@@ -3181,6 +3264,15 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
       has_cp = gs->GetCommandProcessorHangState(cp);
     }
   }
+
+  RexScreenWatcherStatus sw_st{};
+  std::vector<RexCandidateButton> sw_cands;
+  rex_monitor::GetScreenWatcherState(sw_st, sw_cands);
+  const int64_t now_ms_log = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+  const int64_t sw_stale_ms =
+      (sw_st.last_update_ms > 0) ? (now_ms_log - static_cast<int64_t>(sw_st.last_update_ms)) : -1;
 
 #ifdef _WIN32
   uint64_t main_pcs[24]{};
@@ -3205,12 +3297,15 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
 
   const char* stage = g_main_xthread_stage.load(std::memory_order_acquire);
   const char* state_name = rex::GetGuestThreadStateName(boot_tel.guest_state);
+  const char* report_kind =
+      is_manual_dump ? "Manual Diagnostic (F9)" : (is_gpu_stall ? "GPU Stall" : "Guest Hang");
   std::fprintf(f,
-               "Peggle 2 %s Report (Build=%s RT=%s)\n"
+               "Peggle 2 %s Report (Build=%s RT=%s EDRAM=%s)\n"
                "StallMs=%llu | TotalHooks=%llu | VdSwaps=%llu | GpuSwaps=%llu | IssueSwaps=%llu | GuestGpuTimeouts=%u | Screen=%u\n"
                "MainXThread: State=%s%s | Stage=%s | GuestPC=0x%08X | GuestLR=0x%08X | Ticks=%llu | VBlanks=%llu\n",
-               is_gpu_stall ? "GPU Stall" : "Guest Hang",
+               report_kind,
                GetAppBuildSha(), rex::GetRuntimeBuildTag(),
+               rex::ui::Presenter::GetActiveEdramPathName(),
                static_cast<unsigned long long>(stall_ms),
                static_cast<unsigned long long>(total_hooks),
                static_cast<unsigned long long>(boot_tel.vd_swaps),
@@ -3223,6 +3318,33 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
                boot_tel.guest_pc, boot_tel.guest_lr,
                static_cast<unsigned long long>(boot_tel.guest_ticks),
                static_cast<unsigned long long>(boot_tel.vblanks));
+
+  std::fprintf(f,
+               "GpuRates: Draws=%u/s Res=%u/s Early=%llu (%s) Tmo=%llu Lost=%d Removed=0x%08X | "
+               "Frontbuffer=0x%08X (%ux%u) | Totals: Draws=%llu Resolves=%llu\n"
+               "ScreenWatcher: seq=%llu hash=0x%08X screen=%s cand=%zu motion=%.1f%% stale_ms=%lld hl=%s tgt=%s\n"
+               "InputState: active=%d ctrl=%d in_vp=%d nx=%.3f ny=%.3f primary=%d buttons=0x%04X menu_open=%d\n",
+               cp.gpu_draws_per_sec, cp.gpu_resolves_per_sec,
+               static_cast<unsigned long long>(cp.issue_swap_early_returns),
+               cp.last_issue_swap_early_reason ? cp.last_issue_swap_early_reason : "none",
+               static_cast<unsigned long long>(cp.fence_timeout_count),
+               cp.device_lost ? 1 : 0, cp.device_removed_reason,
+               cp.last_frontbuffer_ptr, cp.last_frontbuffer_width, cp.last_frontbuffer_height,
+               static_cast<unsigned long long>(cp.gpu_draw_count),
+               static_cast<unsigned long long>(cp.gpu_resolve_count),
+               static_cast<unsigned long long>(sw_st.last_frame_seq), sw_st.pixel_hash,
+               sw_st.screen_name[0] ? sw_st.screen_name : "UNKNOWN", sw_cands.size(),
+               sw_st.motion_pct, static_cast<long long>(sw_stale_ms),
+               sw_st.has_highlight ? sw_st.hl_name : "none",
+               sw_st.has_target ? sw_st.target_name : "None",
+               g_input_debug_game_active.load(std::memory_order_relaxed) ? 1 : 0,
+               g_input_debug_ctrl_active.load(std::memory_order_relaxed) ? 1 : 0,
+               g_input_debug_cursor_valid.load(std::memory_order_relaxed) ? 1 : 0,
+               g_input_debug_cursor_nx.load(std::memory_order_relaxed),
+               g_input_debug_cursor_ny.load(std::memory_order_relaxed),
+               g_input_debug_primary_down.load(std::memory_order_relaxed) ? 1 : 0,
+               static_cast<unsigned int>(g_input_debug_buttons.load(std::memory_order_relaxed)),
+               g_menu_open.load(std::memory_order_relaxed) ? 1 : 0);
 
   const uint32_t total_imp = boot_tel.last_import_count;
   const uint32_t start_imp = (total_imp > 8u) ? (total_imp - 8u) : 0u;
@@ -3258,13 +3380,12 @@ static void WriteGuestHangLog(const rex::RexBootTelemetrySnapshot& boot_tel, uin
 #endif
   std::fflush(f);
   std::fclose(f);
-  std::printf("[WATCHDOG] %s (>%llums) logged to %s | State=%s%s [%s] | sub=%llu/%llu hr=0x%08X\n",
-              is_gpu_stall ? "GPU stall" : "Guest hang",
-              static_cast<unsigned long long>(stall_ms), log_path.string().c_str(),
-              state_name, boot_tel.gpu_fence_wait ? "+GPUWait" : "", stage ? stage : "unknown",
-              static_cast<unsigned long long>(cp.submission_current),
-              static_cast<unsigned long long>(cp.submission_completed),
-              cp.device_removed_reason);
+  std::printf("[WATCHDOG] %s logged to %s | Draws=%u/s Res=%u/s Early=%llu Tmo=%llu Lost=%d hash=0x%08X hr=0x%08X\n",
+              report_kind, log_path.string().c_str(),
+              cp.gpu_draws_per_sec, cp.gpu_resolves_per_sec,
+              static_cast<unsigned long long>(cp.issue_swap_early_returns),
+              static_cast<unsigned long long>(cp.fence_timeout_count),
+              cp.device_lost ? 1 : 0, sw_st.pixel_hash, cp.device_removed_reason);
   std::fflush(stdout);
 }
 
@@ -3284,6 +3405,29 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
   static bool s_has_cached_cp = false;
   static bool s_logged_hang = false;
 
+  const uint64_t cur_hook = g_hook_total_calls.load(std::memory_order_relaxed);
+  bool trigger_manual_dump = g_manual_diag_requested.exchange(false, std::memory_order_acq_rel);
+#ifdef _WIN32
+  {
+    static bool s_prev_f9_ui = false;
+    HWND fg = GetForegroundWindow();
+    DWORD fg_pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+    HWND app_hwnd = g_app_hwnd.load(std::memory_order_acquire);
+    const bool active = (fg_pid == GetCurrentProcessId()) ||
+                        (app_hwnd && fg && (fg == app_hwnd || GetAncestor(fg, GA_ROOTOWNER) == app_hwnd));
+    const bool down = active && ((GetAsyncKeyState(VK_F9) & 0x8000) != 0);
+    if (down && !s_prev_f9_ui) {
+      trigger_manual_dump = true;
+    }
+    s_prev_f9_ui = down;
+  }
+#endif
+  if (trigger_manual_dump) {
+    WriteGuestHangLog(boot_tel, 0, cur_hook, false, true);
+    g_manual_dump_flash_until_ms.store(now_ms + 2500, std::memory_order_relaxed);
+  }
+
   if (boot_tel.boot_stage < 5 || rex::IsAppBackgroundPaused() ||
       g_locate_state.active.load(std::memory_order_acquire)) {
     s_initialized = false;
@@ -3294,7 +3438,6 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
     return;
   }
 
-  const uint64_t cur_hook = g_hook_total_calls.load(std::memory_order_relaxed);
   const uint64_t cur_vdswap = boot_tel.vd_swaps;
   if (!s_initialized) {
     s_initialized = true;
@@ -3327,9 +3470,20 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
     }
   }
   if (s_has_cached_cp) {
+    g_rate_gpu_draws_hz.store(s_cached_cp.gpu_draws_per_sec, std::memory_order_relaxed);
+    g_rate_gpu_resolves_hz.store(s_cached_cp.gpu_resolves_per_sec, std::memory_order_relaxed);
+    g_gpu_early_returns.store(s_cached_cp.issue_swap_early_returns, std::memory_order_relaxed);
+    g_gpu_fence_timeouts.store(s_cached_cp.fence_timeout_count, std::memory_order_relaxed);
+    g_gpu_device_lost.store(s_cached_cp.device_lost ? 1 : 0, std::memory_order_relaxed);
+
     const uint64_t cur_gpuswap = s_cached_cp.refresh_guest_output_count;
-    if (cur_gpuswap != s_prev_gpuswap || cur_vdswap == s_vdswap_at_gpu_progress) {
-      s_prev_gpuswap = cur_gpuswap;
+    const bool swap_progressed = (cur_gpuswap != s_prev_gpuswap);
+    s_prev_gpuswap = cur_gpuswap;
+    const bool gpu_healthy =
+        swap_progressed && (s_cached_cp.gpu_draws_per_sec > 0) &&
+        (s_cached_cp.gpu_resolves_per_sec > 0) &&
+        (s_cached_cp.issue_swap_early_returns == 0) && !s_cached_cp.device_lost;
+    if (cur_vdswap == s_vdswap_at_gpu_progress || gpu_healthy) {
       s_vdswap_at_gpu_progress = cur_vdswap;
       s_last_gpu_progress_ms = now_ms;
     } else {
@@ -3366,12 +3520,12 @@ static void UpdateGuestHangWatchdog(const rex::RexBootTelemetrySnapshot& boot_te
     {
       std::lock_guard<std::mutex> lock(g_hang_hud_mutex);
       std::snprintf(g_hang_hud_state, sizeof(g_hang_hud_state),
-                    "Stage=%s rd=0x%X wr=0x%X sub=%llu/%llu hr=0x%08X",
-                    s_cached_cp.worker_stage ? s_cached_cp.worker_stage : "?",
-                    s_cached_cp.read_ptr, s_cached_cp.write_ptr,
-                    static_cast<unsigned long long>(s_cached_cp.submission_current),
-                    static_cast<unsigned long long>(s_cached_cp.submission_completed),
-                    s_cached_cp.device_removed_reason);
+                    "Draws=%u Res=%u Early=%llu Tmo=%llu Lost=%d hr=0x%08X Stage=%s",
+                    s_cached_cp.gpu_draws_per_sec, s_cached_cp.gpu_resolves_per_sec,
+                    static_cast<unsigned long long>(s_cached_cp.issue_swap_early_returns),
+                    static_cast<unsigned long long>(s_cached_cp.fence_timeout_count),
+                    s_cached_cp.device_lost ? 1 : 0, s_cached_cp.device_removed_reason,
+                    s_cached_cp.worker_stage ? s_cached_cp.worker_stage : "?");
     }
     g_hang_is_gpu_stall.store(true, std::memory_order_relaxed);
     g_guest_hang_detected.store(true, std::memory_order_release);
@@ -3909,6 +4063,12 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     g_rate_vblank_hz.load(std::memory_order_relaxed),
                     g_rate_present_hz.load(std::memory_order_relaxed),
                     GetAppBuildSha());
+        ImGui::Text("Gpu:   Draws=%u Res=%u Early=%llu Tmo=%llu Lost=%d",
+                    g_rate_gpu_draws_hz.load(std::memory_order_relaxed),
+                    g_rate_gpu_resolves_hz.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(g_gpu_early_returns.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(g_gpu_fence_timeouts.load(std::memory_order_relaxed)),
+                    g_gpu_device_lost.load(std::memory_order_relaxed));
 #endif
         ImGui::Text("Render Res:     %ux%u (%.2fx)", ren_w, ren_h, ren_scale);
         ImGui::Text("VSync:          %s", vsync_idx == kVSyncOff ? "Off (Host Pacer)" : "On (Swapchain)");
@@ -3937,10 +4097,20 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         }
         ImGui::Separator();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.85f, 1.0f));
-        ImGui::Text("[F1] Settings | [F6] %s | [F7] %s",
+        ImGui::Text("[F1] Settings | [F6] %s | [F7] %s | [F9] Dump Diag",
                     g_rec_active.load(std::memory_order_relaxed) ? "Stop Rec" : "Rec",
                     g_play_active.load(std::memory_order_relaxed) ? "Stop Play" : "Play");
         ImGui::PopStyleColor();
+        {
+          const int64_t flash_until = g_manual_dump_flash_until_ms.load(std::memory_order_relaxed);
+          const int64_t now_hud_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count();
+          if (now_hud_ms < flash_until) {
+            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+                               "[F9] Diagnostic saved to peggle2_hang.log");
+          }
+        }
       } else if (hud_mode == kHudMinimal) {
         const char* rec_tag = g_rec_active.load(std::memory_order_relaxed) ? " [REC]" :
                               (g_play_active.load(std::memory_order_relaxed) ? " [PLAY]" : "");
@@ -3970,7 +4140,7 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
         ImGui::Text("Aim [F2]: %s | Menu [F3]: %s | %s Q=%u",
                     AimModeName(aim_mode_hud), MenuModeName(menu_mode_hud),
                     hud_in_gp ? "GAMEPLAY" : "MENUS", hud_gpu.quad_count);
-        ImGui::Text("Host: %.1f FPS (%.1fms) | Ren: %.1f | Sim: %.1f (%.2fx) | %ux%u | Stick=%d%s | [F1]",
+        ImGui::Text("Host: %.1f FPS (%.1fms) | Ren: %.1f | Sim: %.1f (%.2fx) | %ux%u | Stick=%d%s | [F1] | [F9]",
                     host_fps, host_ms, ren_fps, sim_fps, speed,
                     ren_w, ren_h,
                     (int)g_telemetry_stick_lx.load(std::memory_order_relaxed), rec_tag);
@@ -3983,6 +4153,12 @@ class ReXGlueSettingsDialog : public rex::ui::ImGuiDialog {
                     g_rate_vblank_hz.load(std::memory_order_relaxed),
                     g_rate_present_hz.load(std::memory_order_relaxed),
                     GetAppBuildSha());
+        ImGui::Text("Gpu:   Draws=%u Res=%u Early=%llu Tmo=%llu Lost=%d",
+                    g_rate_gpu_draws_hz.load(std::memory_order_relaxed),
+                    g_rate_gpu_resolves_hz.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(g_gpu_early_returns.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(g_gpu_fence_timeouts.load(std::memory_order_relaxed)),
+                    g_gpu_device_lost.load(std::memory_order_relaxed));
 #endif
       }
     }
@@ -4685,17 +4861,23 @@ static std::thread g_cadence_reporter([] {
     last_vblank_count = cur_vblank;
 
     static uint64_t last_gpuswap_count = 0;
-    uint64_t cur_gpuswap = 0;
+    rex::system::CommandProcessorHangState cp{};
+    bool has_cp = false;
     if (auto* rt = rex::Runtime::instance()) {
       if (auto* gs = rt->graphics_system()) {
-        rex::system::CommandProcessorHangState cp{};
-        if (gs->GetCommandProcessorHangState(cp)) {
-          cur_gpuswap = cp.refresh_guest_output_count;
-        }
+        has_cp = gs->GetCommandProcessorHangState(cp);
       }
     }
+    const uint64_t cur_gpuswap = has_cp ? cp.refresh_guest_output_count : 0;
     const uint32_t gpuswap_hz = static_cast<uint32_t>(cur_gpuswap - last_gpuswap_count);
     last_gpuswap_count = cur_gpuswap;
+    if (has_cp) {
+      g_rate_gpu_draws_hz.store(cp.gpu_draws_per_sec, std::memory_order_relaxed);
+      g_rate_gpu_resolves_hz.store(cp.gpu_resolves_per_sec, std::memory_order_relaxed);
+      g_gpu_early_returns.store(cp.issue_swap_early_returns, std::memory_order_relaxed);
+      g_gpu_fence_timeouts.store(cp.fence_timeout_count, std::memory_order_relaxed);
+      g_gpu_device_lost.store(cp.device_lost ? 1 : 0, std::memory_order_relaxed);
+    }
 
     uint32_t f2 = g_f2c8_updates.exchange(0);
     uint32_t hook_hz = g_vdswap_calls.exchange(0, std::memory_order_relaxed);
@@ -4725,12 +4907,17 @@ static std::thread g_cadence_reporter([] {
     int fps_idx = g_target_fps_index.load(std::memory_order_relaxed);
     float speed = (guest_fps_val > 0) ? ((float)guest_fps_val / 60.0f) : 1.00f;
     printf("[Framerate Mode: %s | RT=%s] CADENCE 1s: Rates: Hook=%u VdSwap=%u GpuSwap=%u VBlank=%u Present=%u Build=%s | "
+           "Gpu(Draws=%u Res=%u Early=%llu Tmo=%llu Lost=%d) | "
            "Rendered=%u Sim=%u (%.2fx speed) | "
            "HostFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u >33ms=%u) | "
            "GuestFT(p50=%.2f p95=%.2f p99=%.2f max=%.2f >20ms=%u) | "
            "Perf(cpu=%.2f pres=%.2f)\n",
            kFpsPresets[fps_idx].name, rex::GetRuntimeBuildTag(),
            hook_hz, vdswap_hz, gpuswap_hz, vblank_hz, host, GetAppBuildSha(),
+           cp.gpu_draws_per_sec, cp.gpu_resolves_per_sec,
+           static_cast<unsigned long long>(cp.issue_swap_early_returns),
+           static_cast<unsigned long long>(cp.fence_timeout_count),
+           cp.device_lost ? 1 : 0,
            ren, guest_fps_val, speed,
            hft.p50, hft.p95, hft.p99, hft.max, hft.over20, hft.over33,
            gft.p50, gft.p95, gft.p99, gft.max, gft.over20,
@@ -5118,7 +5305,11 @@ extern "C" REX_FUNC(sub_8260D410) {
       HWND fg = GetForegroundWindow();
       DWORD proc_id = 0;
       if (fg) GetWindowThreadProcessId(fg, &proc_id);
-      bool is_game_active = (proc_id == GetCurrentProcessId());
+      HWND app_hwnd = g_app_hwnd.load(std::memory_order_acquire);
+      bool is_game_active =
+          (proc_id == GetCurrentProcessId()) ||
+          (app_hwnd && fg && (fg == app_hwnd || GetAncestor(fg, GA_ROOTOWNER) == app_hwnd));
+      HWND vp_hwnd = (app_hwnd && IsWindow(app_hwnd)) ? app_hwnd : fg;
 #else
       bool is_game_active = true;
 #endif
@@ -5285,15 +5476,19 @@ extern "C" REX_FUNC(sub_8260D410) {
           s_last_screen_cursor = cur_pt;
           s_has_last_screen_cursor = true;
 
-          if (cursor_moved && !menu_open && cursor_enabled) {
+          const bool raw_btn_any = !menu_open && cursor_enabled &&
+                                   (((GetAsyncKeyState(vk_primary) & 0x8000) != 0) ||
+                                    ((GetAsyncKeyState(vk_secondary) & 0x8000) != 0) ||
+                                    (wheel != 0));
+          if ((cursor_moved && !menu_open && cursor_enabled) || raw_btn_any) {
             s_controller_active = false;
             s_manual_aim_override = false;
           }
 
           RECT rc{};
-          if (GetClientRect(fg, &rc) && !menu_open) {
+          if (vp_hwnd && GetClientRect(vp_hwnd, &rc) && !menu_open) {
             POINT client_pt = cur_pt;
-            ScreenToClient(fg, &client_pt);
+            ScreenToClient(vp_hwnd, &client_pt);
             float client_w = static_cast<float>(rc.right - rc.left);
             float client_h = static_cast<float>(rc.bottom - rc.top);
             bool in_window = (client_pt.x >= 0 && client_pt.x <= rc.right &&
@@ -5319,6 +5514,10 @@ extern "C" REX_FUNC(sub_8260D410) {
         secondary_pressed = raw_secondary_down && !s_prev_secondary_down;
         s_prev_primary_down = raw_primary_down;
         s_prev_secondary_down = raw_secondary_down;
+        g_input_debug_cursor_valid.store(cursor_in_vp && !menu_open, std::memory_order_relaxed);
+        g_input_debug_cursor_nx.store(norm_x, std::memory_order_relaxed);
+        g_input_debug_cursor_ny.store(norm_y, std::memory_order_relaxed);
+        g_input_debug_primary_down.store(raw_primary_down, std::memory_order_relaxed);
 #elif REX_PLATFORM_IOS
         RexIosTouchSnapshot ts = rex_ios_consume_touch_for_guest();
         norm_x = ts.u;
@@ -5715,6 +5914,9 @@ extern "C" REX_FUNC(sub_8260D410) {
 
       g_mouse_direct_active.store(direct_cursor_ok, std::memory_order_relaxed);
       combined_buttons = existing_buttons | mouse_buttons;
+      g_input_debug_game_active.store(is_game_active, std::memory_order_relaxed);
+      g_input_debug_ctrl_active.store(s_controller_active, std::memory_order_relaxed);
+      g_input_debug_buttons.store(combined_buttons, std::memory_order_relaxed);
       combined_lt = (std::max)(existing_lt, mouse_lt);
       combined_rt = existing_rt;
       combined_lx = (!s_controller_active && mouse_stick_x != 0) ? mouse_stick_x : existing_lx;

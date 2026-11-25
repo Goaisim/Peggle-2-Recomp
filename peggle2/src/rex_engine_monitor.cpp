@@ -558,6 +558,14 @@ void UpdateScreenWatcherFrameLocked(uint64_t now_ms) {
   g_sw_status.last_frame_seq = g_sw_curr_frame.sequence;
   g_sw_status.last_update_ms = now_ms;
   g_sw_status.has_pixel_frame = !g_sw_curr_frame.pixels.empty();
+  uint32_t pix_hash = 2166136261u;
+  const uint8_t* hash_px = g_sw_curr_frame.pixels.data();
+  const size_t hash_bytes = g_sw_curr_frame.pixels.size();
+  for (size_t i = 0; i < hash_bytes; i += 16) {
+    pix_hash ^= hash_px[i];
+    pix_hash *= 16777619u;
+  }
+  g_sw_status.pixel_hash = hash_bytes ? pix_hash : 0u;
 
   const size_t px_count = size_t(g_sw_curr_frame.width) * size_t(g_sw_curr_frame.height);
   if (px_count > 0 && g_sw_prev_frame.pixels.size() == g_sw_curr_frame.pixels.size()) {
@@ -1376,8 +1384,11 @@ RexScreenId ClassifyPageFromPixelsLocked(const PageFingerprint& fp) {
 }
 
 void AppendDynamicAdventureBoxesLocked() {
+  // Peggle Institute's left card is solid bright UI-blue, whereas Mountain Highs has Berg's
+  // ice-blue card glass/arm in [0.17..0.22]. Checking btn_blue_frac avoids misclassifying
+  // Mountain Highs as Peggle Institute and shifting LEVELS onto Berg's card / TRIALS onto LEVELS.
   const RegionColorStats inst_probe = SampleRegionColorsLocked(0.170f, 0.470f, 0.220f, 0.670f);
-  const float blue_or_gold_ratio = inst_probe.gold_frac + inst_probe.blue_frac;
+  const float blue_or_gold_ratio = inst_probe.gold_frac + inst_probe.btn_blue_frac;
   const RegionColorStats right_card = SampleRegionColorsLocked(0.60f, 0.45f, 0.92f, 0.70f);
   const bool no_right_card =
       (right_card.ui_frac() < 0.08f && right_card.modal_blue_frac < 0.10f);
@@ -1724,6 +1735,22 @@ void BuildAndScoreCandidatesLocked(const RexGpuUiMonitorSnapshotMirror& gpu, uin
         }
         s_page_watch_active = false;
         s_fp_baseline = curr_fp;
+      } else if (s_transition_pending && now_ms >= s_transition_settle_ms &&
+                 (!IsFullScreenFadeLocked() || now_ms >= s_transition_settle_ms + 550ull)) {
+        // Animated backgrounds (e.g. Mountain Highs particles) can keep motion > 12% and extend
+        // s_page_watch_until_ms up to 3.5s; unblock user input once settle window elapses.
+        const RexScreenId vis = ClassifyPageFromPixelsLocked(curr_fp);
+        if (vis != SCREEN_UNKNOWN && vis != s_page_watch_source) {
+          SetLockedScreenLocked(
+              (vis == SCREEN_MODAL_OK_POPUP)
+                  ? EnterModalPopupLocked(s_current_screen, DetectModalDialogLocked())
+                  : vis);
+          s_page_watch_active = false;
+        } else if (now_ms >= s_transition_settle_ms + 300ull) {
+          SetLockedScreenLocked(ResolvePendingTransitionLocked(true));
+        }
+        s_transition_pending = false;
+        s_fp_baseline = curr_fp;
       }
     } else if (s_transition_pending && now_ms >= s_transition_settle_ms) {
       SetLockedScreenLocked(ResolvePendingTransitionLocked(true));
@@ -1889,6 +1916,11 @@ void BuildAndScoreCandidatesLocked(const RexGpuUiMonitorSnapshotMirror& gpu, uin
   }
 
   // Fallback path for unit self-test synthetic GPU quad snapshots (--test_colliders).
+  if (s_transition_pending && now_ms >= s_transition_settle_ms) {
+    SetLockedScreenLocked(ResolvePendingTransitionLocked(true));
+    s_transition_pending = false;
+    s_page_watch_active = false;
+  }
   if (!g_has_synthetic_snap) {
     g_sw_status.screen_id = s_current_screen;
     std::snprintf(g_sw_status.screen_name, sizeof(g_sw_status.screen_name), "%s",
@@ -2257,7 +2289,13 @@ void NotifyMenuActionInput(uint16_t action_mask, uint64_t now_ms) {
     g_last_step_now_ms = now_ms;
   }
   BuildAndScoreCandidatesLocked(g_last_gpu_snap, now_ms);
-  if (s_transition_pending || (HasActivePixelFrameLocked() && IsFullScreenFadeLocked())) {
+  const bool frame_fresh =
+      HasActivePixelFrameLocked() &&
+      (g_has_synthetic_frame || g_sw_status.last_update_ms == 0 ||
+       now_ms < g_sw_status.last_update_ms ||
+       (now_ms - g_sw_status.last_update_ms) <= 1000ull);
+  if ((s_transition_pending && now_ms < s_transition_settle_ms + 300ull) ||
+      (frame_fresh && IsFullScreenFadeLocked())) {
     return;  // Ignore rapid double-clicks / fade clicks until 0.45s settle completes
   }
   if (s_current_screen == SCREEN_TITLE && g_sw_candidates.empty()) {
@@ -2361,8 +2399,15 @@ RexMonitorServoOutput StepMenuFocusServoLocked(const RexGpuUiMonitorSnapshotMirr
   UpdateScreenWatcherFrameLocked(now_ms);
   SampleCursorRgbLocked(norm_x, norm_y);
   BuildAndScoreCandidatesLocked(gpu, now_ms, true);
+  const bool frame_fresh =
+      HasActivePixelFrameLocked() &&
+      (g_has_synthetic_frame || g_sw_status.last_update_ms == 0 ||
+       now_ms < g_sw_status.last_update_ms ||
+       (now_ms - g_sw_status.last_update_ms) <= 1000ull);
+  const bool transition_blocking =
+      s_transition_pending && (now_ms < s_transition_settle_ms + 300ull);
   const bool input_blocked =
-      s_transition_pending || (HasActivePixelFrameLocked() && IsFullScreenFadeLocked());
+      transition_blocking || (frame_fresh && IsFullScreenFadeLocked());
   const bool allow_hover_eff = allow_hover_servo && !input_blocked;
   const bool click_eff = click_trigger && !input_blocked;
 
@@ -2593,7 +2638,12 @@ RexMonitorServoOutput StepMenuFocusServoLocked(const RexGpuUiMonitorSnapshotMirr
   out.aligned = grid_aligned || pos_aligned;
   g_sw_status.aligned = out.aligned;
 
-  if (out.aligned) {
+  const float eff_motion_pct = frame_fresh ? g_sw_status.motion_pct : 0.0f;
+  const bool eff_in_transition = frame_fresh && g_sw_status.in_transition;
+
+  if (out.aligned ||
+      (!frame_fresh && pending_click &&
+       !(tgt.flags & (kCandCarouselScrollLeft | kCandCarouselScrollRight)))) {
     g_sw_prev_pulse_valid = false;
     g_sw_used_orthogonal = false;
     if (pending_click) {
@@ -2602,6 +2652,8 @@ RexMonitorServoOutput StepMenuFocusServoLocked(const RexGpuUiMonitorSnapshotMirr
         out.buttons_or_mask |= (qx < 0.6225f) ? 0x0004 : 0x0008;
       } else {
         out.buttons_or_mask |= 0x1000;  // XINPUT_GAMEPAD_A
+        out.aligned = true;
+        g_sw_status.aligned = true;
       }
       const bool in_place_toggle =
           (g_sw_status.screen_id == SCREEN_SETTINGS_SUBMENU && tgt.row == 0) ||
@@ -2611,7 +2663,7 @@ RexMonitorServoOutput StepMenuFocusServoLocked(const RexGpuUiMonitorSnapshotMirr
       }
       g_pending_click_until_ms = 0;
     }
-  } else if (!input_blocked && !g_sw_status.in_transition && g_sw_status.motion_pct < 25.0f &&
+  } else if (!input_blocked && !eff_in_transition && eff_motion_pct < 25.0f &&
              (allow_hover_eff || pending_click)) {
     const bool fast_deterministic =
         (g_sw_status.screen_id == SCREEN_LEVEL_SELECT ||
@@ -2622,8 +2674,8 @@ RexMonitorServoOutput StepMenuFocusServoLocked(const RexGpuUiMonitorSnapshotMirr
     const uint64_t dpad_cooldown_ms =
         (g_sw_status.screen_id == SCREEN_ADVENTURE_CAROUSEL) ? 220ull : base_cd;
     const bool waiting_new_frame =
-        !fast_deterministic && HasActivePixelFrameLocked() && g_sw_last_pulse_frame_seq != 0 &&
-        g_sw_curr_frame.sequence == g_sw_last_pulse_frame_seq &&
+        frame_fresh && !fast_deterministic && HasActivePixelFrameLocked() &&
+        g_sw_last_pulse_frame_seq != 0 && g_sw_curr_frame.sequence == g_sw_last_pulse_frame_seq &&
         (now_ms - g_last_servo_dpad_ms < 260ull);
     if ((now_ms - g_last_servo_dpad_ms < dpad_cooldown_ms) || waiting_new_frame) {
       g_last_servo = out;

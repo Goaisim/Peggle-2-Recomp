@@ -92,6 +92,7 @@ struct RexCandidateButton {
 struct RexScreenWatcherStatus {
   uint64_t last_frame_seq;
   uint64_t last_update_ms;
+  uint32_t pixel_hash;
   float motion_pct;
   bool in_transition;
   bool has_pixel_frame;
